@@ -14,8 +14,9 @@ import machine
 # Use minimal SPI setup for testing
 spi = machine.SPI(0, baudrate=1000000)
 cs_pin = machine.Pin(17, machine.Pin.OUT)
-
-dwm = dw1000.DW1000(spi, cs_pin, None, None)
+reset_pin = machine.Pin(21, machine.Pin.OUT)
+irq_pin = machine.Pin(20, machine.Pin.IN)
+dwm = dw1000.DW1000(spi, cs_pin, reset_pin, irq_pin)
 if dwm.init():
     device_id = dwm.read_device_id()
     print(f"Actual device ID: 0x{device_id:08X}")

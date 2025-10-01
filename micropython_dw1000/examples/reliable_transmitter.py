@@ -33,7 +33,7 @@ def main():
         # Configure device
         print("Configuring DW1000...")
         dwm.configure({
-            'channel': 5,
+            'channel': 2,
             'data_rate': dw1000.BR_850K
         })
         print("✅ Configuration complete")

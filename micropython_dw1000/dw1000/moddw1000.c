@@ -14,6 +14,7 @@
 #include "py/runtime.h"
 #include "py/obj.h"
 #include "py/objtype.h"
+#include <string.h>
 #include "py/stream.h"
 #include "py/mperrno.h"
 #include "py/mphal.h"
@@ -29,6 +30,18 @@
 // Include the DW1000 driver
 #include "../../dw1000-driver/deca_device_api.h"
 #include "../../dw1000-driver/deca_regs.h"
+
+// Custom RX state definitions (not in driver header)
+#define SYS_STATE_RX_STATE      0x0000000FUL    /* RX State mask */
+#define SYS_STATE_TX_STATE      0x000000F0UL    /* TX State mask */
+#define SYS_STATE_PMSC_STATE    0x00000F00UL    /* PMSC State mask */
+
+// RX states (from DW1000 manual)
+#define RX_STATE_IDLE           0x00
+#define RX_STATE_RX_READY       0x01
+#define RX_STATE_RX_WAIT_SFD    0x02
+#define RX_STATE_RX_DATA        0x03
+#define RX_STATE_RX_VALIDATE    0x05
 
 // Local function declarations
 STATIC mp_obj_t dw1000_make_new(const mp_obj_type_t *type, size_t n_args, size_t n_kw, const mp_obj_t *args);
@@ -60,7 +73,7 @@ STATIC mp_obj_t dw1000_make_new(const mp_obj_type_t *type, size_t n_args, size_t
 /*! ------------------------------------------------------------------------------------------------------------------
  * @fn dw1000_init()
  *
- * @brief Initialize the DW1000 device
+ * @brief Initialize the DW1000 device with comprehensive setup (based on Polypoint)
  */
 STATIC mp_obj_t dw1000_init(mp_obj_t self_in) {
     dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
@@ -80,13 +93,60 @@ STATIC mp_obj_t dw1000_init(mp_obj_t self_in) {
         deca_sleep(10);                      // Wait for startup
     }
     
-    // Initialize DW1000 driver
-    int result = dwt_initialise(DWT_LOADUCODE);
+    // Initialize DW1000 driver with available flags
+    int result = dwt_initialise(DWT_LOADUCODE);  // Load microcode only
     if (result != DWT_SUCCESS) {
         mp_raise_OSError(MP_EIO);
         return mp_const_false;
     }
     
+    // Enhanced configuration based on lab11 dw1000-driver and Polypoint
+    dwt_config_t config = {
+        .chan = 5,
+        .prf = DWT_PRF_64M,
+        .txPreambLength = DWT_PLEN_128,
+        .rxPAC = DWT_PAC8,
+        .txCode = 9,
+        .rxCode = 9,
+        .nsSFD = 1,
+        .dataRate = DWT_BR_6M8,
+        .phrMode = DWT_PHRMODE_STD,
+        .sfdTO = (128 + 1 + 8 - 8)
+    };
+    
+    // Configure the device (dwt_configure doesn't return a value in this driver)
+    dwt_configure(&config);
+    
+    // CRITICAL: Complete Polypoint-style initialization sequence
+    // 1. Configure TX RF settings
+    static const uint8_t txPower[8] = {0x0, 0x67, 0x67, 0x8b, 0x9a, 0x85, 0x0, 0xd1};
+    static const uint8_t pgDelay[8] = {0x0, 0xc9, 0xc2, 0xc5, 0x95, 0xc0, 0x0, 0x93};
+    dwt_txconfig_t tx_config = {
+        .PGdly = pgDelay[5],  // Channel 5
+        .power = txPower[5]   // Channel 5
+    };
+    dwt_configuretxrf(&tx_config);
+    
+    // 2. Set crystal trim (function is called dwt_setxtaltrim in this driver)
+    dwt_setxtaltrim(8);
+    
+    // 3. Configure antenna delays (0 for end-to-end calibration)
+    uint16_t antenna_delay = 0;
+    dwt_setrxantennadelay(antenna_delay);
+    dwt_settxantennadelay(antenna_delay);
+    
+    // Configure interrupts (clear all, then set specific ones) 
+    dwt_setinterrupt(0xFFFFFFFF, 0);  // Clear all interrupts
+    dwt_setinterrupt(DWT_INT_TFRS |   // TX frame sent
+                    DWT_INT_RFCG |    // RX frame good
+                    DWT_INT_RPHE |    // RX PHY header error
+                    DWT_INT_RFCE |    // RX CRC error
+                    DWT_INT_RFSL |    // RX sync loss
+                    DWT_INT_RFTO |    // RX timeout
+                    DWT_INT_RXPTO |   // RX preamble timeout
+                    DWT_INT_SFDT |    // SFD timeout
+                    DWT_INT_ARFE, 1); // Frame filtering rejection
+
     self->initialized = true;
     return mp_const_true;
 }
@@ -136,18 +196,18 @@ STATIC mp_obj_t dw1000_configure(size_t n_args, const mp_obj_t *args) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
     }
     
-    // Default configuration
+    // Default configuration (matching dw1000_init for consistency)
     dwt_config_t config = {
-        .chan = 2,                  // Channel 2
+        .chan = 5,                  // Channel 5 (consistent with dw1000_init)
         .prf = DWT_PRF_64M,        // 64 MHz PRF
         .txPreambLength = DWT_PLEN_128, // 128 preamble length
         .rxPAC = DWT_PAC8,         // PAC size 8
         .txCode = 9,               // TX preamble code
         .rxCode = 9,               // RX preamble code
-        .nsSFD = 0,                // Standard SFD
+        .nsSFD = 1,                // Non-standard SFD (matching dw1000_init)
         .dataRate = DWT_BR_6M8,    // 6.8 Mbps
         .phrMode = DWT_PHRMODE_STD, // Standard PHR mode
-        .sfdTO = (129 + 8 - 8)     // SFD timeout
+        .sfdTO = (128 + 1 + 8 - 8) // SFD timeout (matching dw1000_init)
     };
     
     // Override with provided arguments if any
@@ -171,6 +231,30 @@ STATIC mp_obj_t dw1000_configure(size_t n_args, const mp_obj_t *args) {
     
     // Apply configuration
     dwt_configure(&config);
+    
+    // CRITICAL: Apply complete Polypoint initialization sequence after ANY configuration
+    // This ensures consistent initialization regardless of which function calls dwt_configure
+    
+    // 1. Configure TX RF settings (matching the channel)
+    static const uint8_t txPower[8] = {0x0, 0x67, 0x67, 0x8b, 0x9a, 0x85, 0x0, 0xd1};
+    static const uint8_t pgDelay[8] = {0x0, 0xc9, 0xc2, 0xc5, 0x95, 0xc0, 0x0, 0x93};
+    
+    dwt_txconfig_t tx_config = {
+        .PGdly = pgDelay[config.chan],  // Use the actual channel configured
+        .power = txPower[config.chan]   // Use the actual channel configured
+    };
+    dwt_configuretxrf(&tx_config);
+    
+    // 2. Set crystal trim (Polypoint standard)
+    dwt_setxtaltrim(8);
+    
+    // 3. Configure antenna delays (0 for end-to-end calibration)
+    uint16_t antenna_delay = 0;
+    dwt_setrxantennadelay(antenna_delay);
+    dwt_settxantennadelay(antenna_delay);
+    
+    // Set XTAL trim (use default) - use correct function name
+    dwt_setxtaltrim(15);  // Default XTAL trim value
     
     return mp_const_none;
 }
@@ -197,9 +281,9 @@ STATIC mp_obj_t dw1000_tx_frame(mp_obj_t self_in, mp_obj_t data_obj) {
     }
     
     // Write data to TX buffer
-    // Note: DW1000 functions expect total frame length including frame overhead
-    // Trying 4-byte overhead based on receiver analysis
-    uint16_t total_frame_len = bufinfo.len + 4;
+    // Note: DW1000 API expects total frame length including 2-byte CRC that it will add
+    // From API docs: "txFrameLength - This is the total frame length, including the two byte CRC"
+    uint16_t total_frame_len = bufinfo.len + 2;
     dwt_writetxdata(total_frame_len, (uint8_t*)bufinfo.buf, 0);
     dwt_writetxfctrl(total_frame_len, 0, 0);
     
@@ -216,7 +300,7 @@ STATIC MP_DEFINE_CONST_FUN_OBJ_2(dw1000_tx_frame_obj, dw1000_tx_frame);
 /*! ------------------------------------------------------------------------------------------------------------------
  * @fn dw1000_rx_enable()
  *
- * @brief Enable receiver
+ * @brief Enable receiver with comprehensive reset sequence (based on Polypoint)
  */
 STATIC mp_obj_t dw1000_rx_enable(mp_obj_t self_in) {
     dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
@@ -225,17 +309,48 @@ STATIC mp_obj_t dw1000_rx_enable(mp_obj_t self_in) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
     }
     
-    // Enable receiver
-    dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    // Polypoint pattern: Force off first, then reconfigure, then enable
+    dwt_forcetrxoff();
     
-    return mp_const_none;
+    // Wait for transceiver to settle (critical timing)
+    deca_sleep(2);
+    
+    // Clear all status flags 
+    dwt_write32bitreg(SYS_STATUS_ID, 0xFFFFFFFF);
+    
+    // Reset and sync RX buffers  
+    dwt_rxreset();
+    dwt_syncrxbufptrs();
+    
+    // Small delay for buffer reset to complete
+    deca_sleep(1);
+    
+    // Try enabling receiver - return the result
+    int result = dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    
+    // Additional verification: Check if SYS_CTRL RXENAB bit is actually set
+    deca_sleep(1);  // Allow time for register to update
+    uint32_t sys_ctrl = dwt_read32bitreg(SYS_CTRL_ID);
+    
+    if ((sys_ctrl & 0x0100) == 0) {  // RXENAB bit not set
+        // RX enable failed - but let's return false instead of raising exception
+        // This allows diagnostic tools to continue running
+        return mp_const_false;
+    }
+    
+    if (result != DWT_SUCCESS) {
+        mp_raise_OSError(MP_EIO);
+        return mp_const_false;
+    }
+    
+    return mp_const_true;
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_1(dw1000_rx_enable_obj, dw1000_rx_enable);
 
 /*! ------------------------------------------------------------------------------------------------------------------
  * @fn dw1000_read_rx_data()
  *
- * @brief Read received data
+ * @brief Read received data with hardware CRC validation
  */
 STATIC mp_obj_t dw1000_read_rx_data(mp_obj_t self_in) {
     dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
@@ -244,19 +359,42 @@ STATIC mp_obj_t dw1000_read_rx_data(mp_obj_t self_in) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
     }
     
-    // Get frame length (includes frame overhead)
+    // Check hardware CRC status first
+    uint32_t status = dwt_read32bitreg(SYS_STATUS_ID);
+    
+    // Verify frame was received with good CRC (hardware validation)
+    if (!(status & SYS_STATUS_RXFCG)) {
+        // Frame not received or CRC error
+        if (status & SYS_STATUS_RXFCE) {
+            mp_raise_msg(&mp_type_ValueError, MP_ERROR_TEXT("Frame received with CRC error"));
+        }
+        return mp_obj_new_bytes(NULL, 0);  // No frame or invalid frame
+    }
+    
+    // Get frame length from RX_FINFO register (includes 2-byte CRC added by DW1000)
     uint32_t total_frame_len = dwt_read32bitreg(RX_FINFO_ID) & RX_FINFO_RXFLEN_MASK;
     
-    if (total_frame_len < 4) {
+    if (total_frame_len < 2) {
         return mp_obj_new_bytes(NULL, 0);
     }
     
-    // Calculate payload length (exclude frame overhead - trying 4 bytes)
-    // UWB frames may have more overhead than just 2-byte CRC
-    uint32_t payload_len = total_frame_len - 4;
+    // Calculate payload length (exclude 2-byte CRC automatically added by DW1000)
+    // RX_FINFO reports total frame length including CRC, subtract 2 to get user payload
+    uint32_t payload_len = total_frame_len - 2;
     
-    // Allocate buffer and read only the payload data
+    // Safety check - ensure we don't read more than reasonable payload size
+    if (payload_len > 125) {  // DW1000 max frame is 127, so max payload is 125
+        return mp_obj_new_bytes(NULL, 0);
+    }
+    
+    // Allocate buffer and read only the payload data (excluding CRC)
+    // Note: DW1000 RX buffer layout is [payload][2-byte CRC], so we read only payload_len bytes
     uint8_t *buffer = m_new(uint8_t, payload_len);
+    
+    // Clear buffer to detect any uninitialized data
+    memset(buffer, 0, payload_len);
+    
+    // Read exactly the payload bytes from the start of the RX buffer
     dwt_readrxdata(buffer, payload_len, 0);
     
     // Create Python bytes object
@@ -268,6 +406,8 @@ STATIC mp_obj_t dw1000_read_rx_data(mp_obj_t self_in) {
     return result;
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_1(dw1000_read_rx_data_obj, dw1000_read_rx_data);
+
+
 
 /*! ------------------------------------------------------------------------------------------------------------------
  * @fn dw1000_get_status()
@@ -285,6 +425,115 @@ STATIC mp_obj_t dw1000_get_status(mp_obj_t self_in) {
     return mp_obj_new_int_from_uint(status);
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_1(dw1000_get_status_obj, dw1000_get_status);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_force_trx_off()
+ *
+ * @brief Force transceiver off (uses driver's dwt_forcetrxoff which clears status)
+ */
+STATIC mp_obj_t dw1000_force_trx_off(mp_obj_t self_in) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    // Use driver's comprehensive trx off function which also clears status
+    dwt_forcetrxoff();
+    
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_1(dw1000_force_trx_off_obj, dw1000_force_trx_off);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_rx_reset()
+ *
+ * @brief Reset receiver (uses driver's dwt_rxreset)
+ */
+STATIC mp_obj_t dw1000_rx_reset(mp_obj_t self_in) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    // Use driver's receiver reset function
+    dwt_rxreset();
+    
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_1(dw1000_rx_reset_obj, dw1000_rx_reset);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_sync_rx_bufptrs()
+ *
+ * @brief Synchronize RX buffer pointers (uses driver's dwt_syncrxbufptrs)
+ */
+STATIC mp_obj_t dw1000_sync_rx_bufptrs(mp_obj_t self_in) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    // Use driver's buffer pointer sync function
+    dwt_syncrxbufptrs();
+    
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_1(dw1000_sync_rx_bufptrs_obj, dw1000_sync_rx_bufptrs);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_get_sys_state()
+ *
+ * @brief Get system state register for diagnostics
+ */
+STATIC mp_obj_t dw1000_get_sys_state(mp_obj_t self_in) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    uint32_t sys_state = dwt_read32bitreg(SYS_STATE_ID);
+    return mp_obj_new_int_from_uint(sys_state);
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_1(dw1000_get_sys_state_obj, dw1000_get_sys_state);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_get_rx_finfo()
+ *
+ * @brief Get RX frame info register for diagnostics
+ */
+STATIC mp_obj_t dw1000_get_rx_finfo(mp_obj_t self_in) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    uint32_t rx_finfo = dwt_read32bitreg(RX_FINFO_ID);
+    return mp_obj_new_int_from_uint(rx_finfo);
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_1(dw1000_get_rx_finfo_obj, dw1000_get_rx_finfo);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_read_register()
+ *
+ * @brief Read any 32-bit register for advanced diagnostics
+ */
+STATIC mp_obj_t dw1000_read_register(mp_obj_t self_in, mp_obj_t reg_id_obj) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    uint32_t reg_id = mp_obj_get_int(reg_id_obj);
+    uint32_t value = dwt_read32bitreg(reg_id);
+    return mp_obj_new_int_from_uint(value);
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_2(dw1000_read_register_obj, dw1000_read_register);
 
 /*! ------------------------------------------------------------------------------------------------------------------
  * @fn dw1000_print()
@@ -308,6 +557,13 @@ STATIC const mp_rom_map_elem_t dw1000_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_rx_enable), MP_ROM_PTR(&dw1000_rx_enable_obj) },
     { MP_ROM_QSTR(MP_QSTR_read_rx_data), MP_ROM_PTR(&dw1000_read_rx_data_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_status), MP_ROM_PTR(&dw1000_get_status_obj) },
+    { MP_ROM_QSTR(MP_QSTR_force_trx_off), MP_ROM_PTR(&dw1000_force_trx_off_obj) },
+    { MP_ROM_QSTR(MP_QSTR_rx_reset), MP_ROM_PTR(&dw1000_rx_reset_obj) },
+    { MP_ROM_QSTR(MP_QSTR_sync_rx_bufptrs), MP_ROM_PTR(&dw1000_sync_rx_bufptrs_obj) },
+    // Diagnostic functions
+    { MP_ROM_QSTR(MP_QSTR_get_sys_state), MP_ROM_PTR(&dw1000_get_sys_state_obj) },
+    { MP_ROM_QSTR(MP_QSTR_get_rx_finfo), MP_ROM_PTR(&dw1000_get_rx_finfo_obj) },
+    { MP_ROM_QSTR(MP_QSTR_read_register), MP_ROM_PTR(&dw1000_read_register_obj) },
 };
 STATIC MP_DEFINE_CONST_DICT(dw1000_locals_dict, dw1000_locals_dict_table);
 
@@ -327,7 +583,8 @@ STATIC const mp_rom_map_elem_t dw1000_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_DW1000), MP_ROM_PTR(&dw1000_type) },
     
     // Constants
-    { MP_ROM_QSTR(MP_QSTR_DEVICE_ID), MP_ROM_INT(DWT_DEVICE_ID) },
+        // Module constants
+    { MP_ROM_QSTR(MP_QSTR_DEVICE_ID), MP_ROM_INT(0xDECA0130UL) },
     { MP_ROM_QSTR(MP_QSTR_SUCCESS), MP_ROM_INT(DWT_SUCCESS) },
     { MP_ROM_QSTR(MP_QSTR_ERROR), MP_ROM_INT(DWT_ERROR) },
     
@@ -343,6 +600,35 @@ STATIC const mp_rom_map_elem_t dw1000_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_CHANNEL_4), MP_ROM_INT(4) },
     { MP_ROM_QSTR(MP_QSTR_CHANNEL_5), MP_ROM_INT(5) },
     { MP_ROM_QSTR(MP_QSTR_CHANNEL_7), MP_ROM_INT(7) },
+    
+    // Status register bits for diagnostics (from deca_regs.h)
+    { MP_ROM_QSTR(MP_QSTR_SYS_STATUS_RXFCG), MP_ROM_INT(SYS_STATUS_RXFCG) },
+    { MP_ROM_QSTR(MP_QSTR_SYS_STATUS_RXFCE), MP_ROM_INT(SYS_STATUS_RXFCE) },
+    { MP_ROM_QSTR(MP_QSTR_SYS_STATUS_RXRFTO), MP_ROM_INT(SYS_STATUS_RXRFTO) },
+    { MP_ROM_QSTR(MP_QSTR_SYS_STATUS_RXOVRR), MP_ROM_INT(SYS_STATUS_RXOVRR) },
+    { MP_ROM_QSTR(MP_QSTR_SYS_STATUS_RXPHE), MP_ROM_INT(SYS_STATUS_RXPHE) },
+    { MP_ROM_QSTR(MP_QSTR_SYS_STATUS_RXRFSL), MP_ROM_INT(SYS_STATUS_RXRFSL) },
+    { MP_ROM_QSTR(MP_QSTR_SYS_STATUS_RXSFDTO), MP_ROM_INT(SYS_STATUS_RXSFDTO) },
+    { MP_ROM_QSTR(MP_QSTR_SYS_STATUS_LDEERR), MP_ROM_INT(SYS_STATUS_LDEERR) },
+    { MP_ROM_QSTR(MP_QSTR_SYS_STATUS_AFFREJ), MP_ROM_INT(SYS_STATUS_AFFREJ) },
+    
+    // Composite error masks (from deca_regs.h)
+    { MP_ROM_QSTR(MP_QSTR_SYS_STATUS_ALL_RX_ERR), MP_ROM_INT(SYS_STATUS_ALL_RX_ERR) },
+    { MP_ROM_QSTR(MP_QSTR_SYS_STATUS_ALL_RX_GOOD), MP_ROM_INT(SYS_STATUS_ALL_RX_GOOD) },
+    { MP_ROM_QSTR(MP_QSTR_SYS_STATUS_ALL_RX_TO), MP_ROM_INT(SYS_STATUS_ALL_RX_TO) },
+    
+    // Register IDs for direct access
+    { MP_ROM_QSTR(MP_QSTR_SYS_STATUS_ID), MP_ROM_INT(SYS_STATUS_ID) },
+    { MP_ROM_QSTR(MP_QSTR_SYS_STATE_ID), MP_ROM_INT(SYS_STATE_ID) },
+    { MP_ROM_QSTR(MP_QSTR_RX_FINFO_ID), MP_ROM_INT(RX_FINFO_ID) },
+    
+    // System state masks and values (custom definitions)
+    { MP_ROM_QSTR(MP_QSTR_SYS_STATE_RX_STATE), MP_ROM_INT(SYS_STATE_RX_STATE) },
+    { MP_ROM_QSTR(MP_QSTR_RX_STATE_IDLE), MP_ROM_INT(RX_STATE_IDLE) },
+    { MP_ROM_QSTR(MP_QSTR_RX_STATE_RX_READY), MP_ROM_INT(RX_STATE_RX_READY) },
+    { MP_ROM_QSTR(MP_QSTR_RX_STATE_RX_WAIT_SFD), MP_ROM_INT(RX_STATE_RX_WAIT_SFD) },
+    { MP_ROM_QSTR(MP_QSTR_RX_STATE_RX_DATA), MP_ROM_INT(RX_STATE_RX_DATA) },
+    { MP_ROM_QSTR(MP_QSTR_RX_STATE_RX_VALIDATE), MP_ROM_INT(RX_STATE_RX_VALIDATE) },
 };
 STATIC MP_DEFINE_CONST_DICT(dw1000_module_globals, dw1000_module_globals_table);
 
