@@ -42,7 +42,8 @@ def main():
         print("Sending 10 test messages...")
         
         # Transmit messages with error checking
-        for message_count in range(10):
+        message_count = 0
+        while True:
             try:
                 # Create simple message with checksum
                 message_text = f"Test {message_count:03d}"
@@ -73,6 +74,7 @@ def main():
             except Exception as e:
                 print(f"  ❌ Exception during TX: {e}")
                 time.sleep(1)  # Brief pause before continuing
+            message_count += 1
         
         print("\n✅ Transmission sequence complete")
         
