@@ -1,308 +1,161 @@
-# DW1000 MicroPython Project - AI Coding Agent Instructions
+# DW1000 MicroPython Project - AI Coding Instructions
 
 ## Project Overview
 
-This project implements a MicroPython interface for the DecaWave DW1000 Ultra-Wideband (UWB) transceiver. The architecture consists of three main components:
+MicroPython interface for DecaWave DW1000 Ultra-Wideband transceiver targeting **Raspberry Pi Pico/Pico W** with **DW1000 breakout boards** via SPI.
 
-- **`dw1000-driver/`**: Official DecaWave C driver (lab11 fork) - read-only, external dependency
-- **`micropython_dw1000/`**: MicroPython C module wrapper that bridges DW1000 driver to Python API
-- **`polypoint/`**: Reference implementation and examples from the PolyPoint project
+**Architecture:**
+- **`dw1000-driver/`**: Official DecaWave C driver (lab11 fork) - **ALWAYS use this driver**
+- **`micropython_dw1000/`**: MicroPython C wrapper module - **NEVER modify driver, only wrapper**
+- **`polypoint/`**: Reference for understanding driver usage patterns and best practices
 
-## Hardware Setup
+**Key Principle**: The C module is a **thin wrapper** around the lab11 DW1000 driver. All UWB functionality comes from the proven dw1000-driver by 11labs (dw1000-driver/). PolyPoint shows how to use the driver correctly.
 
-This project targets **Raspberry Pi Pico** with **DW1000 breakout boards** connected via SPI. Development uses a **Raspberry Pi Debug Probe** for flashing and debugging.
+**Hardware Setup:**
+- SPI0: 1MHz, pins vary by board
+- Standard: CS=Pin 17, Reset=Pin 21, IRQ=Pin 20
 
-Standard pin configuration:
-- SPI0: baudrate=1000000, pins vary by board
-- CS: Pin 17, Reset: Pin 21, IRQ: Pin 20
+## Current Module Status: ✅ FULLY OPERATIONAL
 
-## Critical API Knowledge
+### ✅ Implemented Features (19 methods):
 
-The current DW1000 Python API is limited compared to diagnostic scripts expectations:
-
-### Available Methods (confirmed working):
+**Core Functionality:**
 ```python
-dwt = dw1000.DW1000(spi, cs_pin, reset_pin, irq_pin)
-dwt.init()                    # Essential first call
-dwt.read_device_id()          # Returns 0xDECA0130 for working device
-dwt.configure(config_dict)    # Device configuration (supports 'channel', 'data_rate')
-dwt.tx_frame(data)           # Transmit data
-dwt.rx_enable()              # Enable receiver - WORKING
-dwt.read_rx_data()           # Read received data
-dwt.get_status()             # Read status register
-dwt.force_trx_off()          # Force transceiver off
-dwt.rx_reset()               # Reset RX buffers
-dwt.sync_rx_bufptrs()        # Sync RX buffer pointers
-dwt.deinit()                 # Cleanup
-
-# NEWLY AVAILABLE after firmware recompile:
-dwt.get_rx_finfo()           # Read RX frame info register (critical for frame length)
-dwt.get_sys_state()          # Read system state register  
-dwt.read_register(reg_id)    # Read any 32-bit register for diagnostics
+dwt = dw1000.DW1000(spi, cs_pin, reset_pin, irq_pin)  # Auto-init enabled
+dwt.read_device_id()        # Returns 0xDECA0130
+dwt.configure(config_dict)  # Channel, data_rate (BR_110K, BR_850K, BR_6M8)
+dwt.tx_frame(data)         # Transmit data
+dwt.rx_enable()            # Enable receiver  
+dwt.read_rx_data()         # Read received data
+dwt.get_status()           # Read status register
+dwt.force_trx_off()        # Force transceiver off
+dwt.rx_reset()             # Reset RX buffers
+dwt.sync_rx_bufptrs()      # Sync RX buffer pointers
+dwt.deinit()               # Cleanup
 ```
 
-### Frame Length Detection (CRITICAL for RX):
+**Enhanced Diagnostics:**
 ```python
-# Proper frame reading with length detection
-rx_finfo = dwt.get_rx_finfo()
-frame_length = rx_finfo & 0x000003FF  # Extract frame length (bits 0-9)
-data = dwt.read_rx_data()  # Now works correctly with length info available
+dwt.get_sys_state()        # System state register
+dwt.get_rx_finfo()         # RX frame info with length detection  
+dwt.read_register(reg_id)  # Read any 32-bit register
 ```
 
-### Configuration Constants Available:
+**🔥 Callback System (EVENT-DRIVEN):**
 ```python
-dw1000.BR_110K    # 110 kbps data rate
-dw1000.BR_850K    # 850 kbps data rate (recommended)
-dw1000.BR_6M8     # 6.8 Mbps data rate
-```
+def rx_callback(frame_info):
+    # frame_info = {'event': 'rx_good', 'status': int, 'length': int, 
+    #               'data': bytes, 'timestamp': int, 'rx_time_ms': int}
+    print(f"Received: {frame_info['data']}")
 
-### Methods NOT Available (common misconception):
-- `read_register()` - doesn't exist in current implementation
-- `get_sys_state()` - not exposed to Python
-- `write_register()` - not implemented
+dwt.set_rx_callback(rx_callback)      # RX frame events
+dwt.set_tx_callback(tx_callback)      # TX completion events  
+dwt.set_error_callback(error_callback) # Error events
+dwt.set_timeout_callback(timeout_cb)   # Timeout events
+dwt.process_events()                   # Trigger callbacks
+dwt.set_auto_rx(True/False)           # Auto RX mode
+```
 
 ## Development Workflow
 
-### Testing on Hardware
+**Testing:** `mpremote run <script.py>`
+
+**Building Custom Firmware:**
 ```bash
-# Connect to Pico via debug probe
-mpremote run <script.py>
-
-# For interactive debugging
-mpremote exec "import dw1000; ..."
+cd micropython/ports/rp2
+make USER_C_MODULES=../../../micropython_dw1000/micropython.cmake BOARD=RPI_PICO -j16
 ```
 
-### Building Custom Firmware
-The project requires custom MicroPython firmware with the DW1000 module compiled in:
+**Working Examples:**
+- `callback_receiver.py` - **RECOMMENDED** - Event-driven receiver with callbacks
+- `enhanced_receiver_working.py` - Polling-based receiver with enhanced diagnostics
+- `test_callbacks.py` - Callback system testing
+- `test_enhanced_init.py` - Basic functionality tests
 
-```bash
-# In MicroPython source tree
-cd ports/rp2
-make USER_C_MODULES=../../../../path/to/micropython_dw1000/micropython.cmake
-```
+## Driver Integration Principles
 
-### Diagnostic Pattern
-The project includes systematic diagnostic scripts:
-- `test_device_id.py` - Basic connectivity test
-- `simple_register_test.py` - Low-level register access (API mismatch - uses non-existent methods)
-- `deep_diagnostic.py` - Comprehensive hardware test (API mismatch - uses non-existent methods)
-- `final_diagnostic.py` - Step-by-step RX enable debugging
-- `test_enhanced_init.py` - Working initialization test
-- `polypoint_receiver.py` - PolyPoint-style receiver implementation
-- `test_850k_transmitter.py` - Working transmitter example
+**Lab11 Driver Usage:**
+- All DW1000 operations go through lab11 driver functions (`dwt_*`)
+- HAL layer (`dw1000_hal.c`) provides MicroPython ↔ driver interface
+- Never modify files in `dw1000-driver/` - it's read-only external dependency
 
-### Working Examples
-For functional examples with complete communication, use:
-- `robust_receiver.py` - **RECOMMENDED** - Solves blocking issues with timeout and error recovery
-- `continuous_transmitter.py` - Indefinite transmitter for testing
-- `continuous_receiver.py` - Basic continuous receiver 
-- `working_solution.py` - Complete working transmitter and receiver with frame length detection
-- `test_enhanced_init.py` - Demonstrates working TX/RX API
-- `polypoint_receiver.py` - Full receiver implementation with PolyPoint patterns
-- `test_850k_transmitter.py` - Simple transmitter example
+**PolyPoint Reference:**
+- Study `polypoint/` for correct driver usage patterns
+- Shows proper initialization sequences, timing, and error recovery
+- Demonstrates real-world UWB application architecture
 
-### Robust Receiver Pattern (SOLVES BLOCKING ISSUES):
+**Adding New Features:**
+1. Find equivalent `dwt_*` function in lab11 driver (`deca_device_api.h`)
+2. Implement wrapper in `moddw1000.c` calling driver function
+3. Add to `dw1000_locals_dict` table
+4. Test on hardware with PolyPoint patterns
+
+## Key Patterns
+
+**Robust Receiver (handles blocking):**
 ```python
-# Robust receiver with timeout and error recovery - PRODUCTION READY
-def robust_receive():
-    dwt = setup_dw1000()
-    reset_receiver(dwt)  # Initial setup
-    
-    ACTIVITY_TIMEOUT = 5000    # Reset if no activity for 5 seconds
-    RESET_INTERVAL = 10000     # Periodic reset every 10 seconds
-    
-    while True:
-        current_time = time.ticks_ms()
-        
-        # Timeout monitoring
-        if time.ticks_diff(current_time, last_activity) > ACTIVITY_TIMEOUT:
-            reset_receiver(dwt)  # Automatic timeout recovery
-            continue
-            
-        # Periodic preventive reset
-        if time.ticks_diff(current_time, last_reset) > RESET_INTERVAL:
-            reset_receiver(dwt)  # Preventive reset
-            continue
-            
-        status = dwt.get_status()
-        
-        # Frame detection and processing
-        if status & (0x2000 | 0x0400 | 0x8000):
-            # Process frame with length detection
-            rx_finfo = dwt.get_rx_finfo()
-            frame_length = rx_finfo & 0x000003FF
-            
-            if frame_good and frame_length > 0:
-                data = dwt.read_rx_data()
-                print(f"Received: {data}")
-            
-            # CRITICAL: Always reset after each frame
-            reset_receiver(dwt)
-            
-        # Error state detection and recovery
-        elif status != 0:
-            if status & 0x1000:    # PHR error
-                reset_receiver(dwt)
-            elif status & 0x10000: # Reed Solomon error  
-                reset_receiver(dwt)
-            elif status & 0x20000: # Frame wait timeout
-                reset_receiver(dwt)
-
-def reset_receiver(dwt):
-    """Complete receiver reset sequence (DW1000 manual recommended)"""
+def setup_robust_receiver():
     dwt.force_trx_off()
-    time.sleep_ms(2)  # Allow proper state transition
-    dwt.rx_reset()
-    dwt.sync_rx_bufptrs()
-    time.sleep_ms(1)
-    dwt.rx_enable()
-```
-
-### Enhanced Receiver Pattern (SOLVES RX ERRORS):
-```python
-# Enhanced receiver with proper frame length detection
-def enhanced_receive():
-    dwt.force_trx_off()
+    time.sleep_ms(2)
     dwt.rx_reset()
     dwt.sync_rx_bufptrs()
     dwt.rx_enable()
-    
-    while True:
-        status = dwt.get_status()
-        frame_good = (status & 0x2000) != 0
-        frame_error = (status & 0x0400) != 0
-        
-        if frame_good or frame_error:
-            # Get actual frame length from RX_FINFO register
-            rx_finfo = dwt.get_rx_finfo()
-            frame_length = rx_finfo & 0x000003FF
-            
-            if frame_good and frame_length > 0:
-                data = dwt.read_rx_data()
-                print(f"Received: {data}")
-            
-            # Reset for next frame
-            dwt.force_trx_off()
-            dwt.rx_reset()
-            dwt.sync_rx_bufptrs()
-            dwt.rx_enable()
+
+def frame_received_callback(frame_info):
+    if frame_info['event'] == 'rx_good':
+        data = frame_info['data']
+        length = frame_info['length']
+        # Process frame...
+    setup_robust_receiver()  # Reset for next frame
 ```
 
-## Current Status
-
-**BREAKTHROUGH: Full Communication + Robust Operation Achieved!** 
-
-**Complete System Operational**:
-- Device ID verification: ✅ Working
-- SPI communication: ✅ Stable  
-- TX functionality: ✅ Working (status 0x028000F3 indicates successful transmission)
-- RX functionality: ✅ FULLY WORKING with frame length detection
-- Hidden methods: ✅ Available (`get_rx_finfo`, `get_sys_state`, `read_register`)
-- Frame decoding: ✅ Successfully reading actual message data
-- Inter-device communication: ✅ Two Picos communicating at 850K data rate
-- **Continuous operation: ✅ SOLVED - No more blocking issues**
-
-**Critical Success: RX Error 0x00810F02 SOLVED**
-- Root cause: Missing frame length information for proper data reading
-- Solution: Use `get_rx_finfo()` to extract frame length from RX_FINFO register
-- Result: Status 0x00006F01 with successful data reads of actual messages
-- Frame length detection working: RX_FINFO shows correct length
-- Actual message decoding: Successfully received continuous message streams
-
-**MAJOR BREAKTHROUGH: Receiver Blocking Issue SOLVED**
-- **Problem**: Receiver would stop receiving after transmission interruption or error states
-- **Root Cause**: Accumulation of error states without proper reset sequences
-- **Solution**: Robust receiver with timeout handling and automatic error recovery
-- **Result**: 100% success rate over 60+ frames with automatic error recovery
-- **Key**: Proper reset sequence after each frame + timeout monitoring + error state detection
-
-## PolyPoint Integration Patterns
-
-### Initialization Sequence (from PolyPoint analysis)
+**Frame Length Detection:**
 ```python
-# 1. Hardware initialization
-dwt = dw1000.DW1000(spi, cs_pin, reset_pin, irq_pin)
-dwt.init()  # Includes DWT_LOADUCODE | DWT_LOADLDO | DWT_LOADTXCONFIG
-
-# 2. Configuration 
-config = {
-    'channel': 2,                    # PolyPoint default
-    'data_rate': dw1000.BR_850K     # Recommended for compatibility
-}
-dwt.configure(config)
-
-# 3. Receiver operation
-dwt.force_trx_off()    # PolyPoint pattern: force off first
-dwt.rx_reset()         # Reset RX buffers
-dwt.sync_rx_bufptrs()  # Sync buffer pointers
-dwt.rx_enable()        # Enable receiver
+rx_finfo = dwt.get_rx_finfo()
+frame_length = rx_finfo & 0x000003FF  # Extract length (bits 0-9)
 ```
 
-### Status Register Monitoring
+**Status Monitoring:**
 ```python
 status = dwt.get_status()
-frame_good = (status & 0x2000) != 0    # Bit 13: RX Frame Good
-frame_error = (status & 0x0400) != 0   # Bit 10: RX Frame Error
-frame_ready = (status & 0x8000) != 0   # Bit 15: RX Frame Ready
-tx_complete = (status & 0x0080) != 0   # Bit 7: TX Frame Sent
+frame_good = (status & 0x2000) != 0    # Bit 13
+frame_error = (status & 0x0400) != 0   # Bit 10  
+tx_complete = (status & 0x0080) != 0   # Bit 7
 ```
 
-## Architecture Patterns
-`dw1000_hal.c/h` provides hardware abstraction between MicroPython and DW1000 driver:
-- SPI communication handling
-- GPIO pin management (CS, reset, IRQ)
-- Timing functions (`deca_sleep`)
+## Missing Lab11 Driver Features (Implementation Candidates)
 
-### Module Structure
-```c
-// moddw1000.c structure
-typedef struct {
-    mp_obj_base_t base;
-    mp_obj_t spi;      // MicroPython SPI object
-    mp_obj_t cs_pin;   // Chip select pin
-    mp_obj_t reset_pin; // Reset pin (optional)
-    mp_obj_t irq_pin;  // IRQ pin (optional)
-    bool initialized;
-} dw1000_obj_t;
-```
+**High Priority:**
+- `dwt_setrxtimeout(uint16)` - RX timeout configuration
+- `dwt_readrxtimestamp()` - RX timestamp reading  
+- `dwt_readtxtimestamp()` - TX timestamp reading
+- `dwt_setdelayedtrxtime(uint32)` - Delayed TX/RX timing
+- `dwt_setrxantennadelay(uint16)` - Antenna delay calibration
+- `dwt_settxantennadelay(uint16)` - Antenna delay calibration
 
-### CMake Integration
-The module uses `USER_C_MODULES` pattern:
-- `micropython.cmake` at root includes module
-- `dw1000/micropython.cmake` defines library and sources
-- Links both wrapper code and original DW1000 driver files
+**Medium Priority:**
+- `dwt_setsniffmode()` - Low power sniff mode
+- `dwt_configuresleep()` - Sleep mode configuration
+- `dwt_getpartid()` - Part ID reading
+- `dwt_getlotid()` - Lot ID reading
+- `dwt_setgpiodirection()/dwt_setgpiovalue()` - GPIO control
 
-## Project-Specific Conventions
+## Module Architecture
+- `moddw1000.c`: Main MicroPython C module (auto-init + callbacks)
+- `dw1000_hal.c/h`: Hardware abstraction layer (SPI, GPIO, timing)
+- `micropython.cmake`: CMake integration for USER_C_MODULES
+- Links to lab11 driver in `dw1000-driver/deca_device.c`
 
-### Error Handling
-- Hardware errors raise `OSError(MP_EIO)`
-- Configuration errors raise `RuntimeError`
-- Always check `initialized` flag before operations
+**Error Handling:**
+- Hardware errors → `OSError(MP_EIO)`
+- Configuration errors → `RuntimeError`
+- All methods require `initialized` flag check
 
-### Testing Strategy
-1. **Device ID verification** - First test for basic SPI communication
-2. **Method availability check** - Use `dir(dwt)` to confirm API
-3. **Step-by-step diagnostics** - Break complex operations into verifiable steps
-4. **Hardware vs software separation** - Distinguish driver bugs from hardware issues
+## Current Status: 🏆 PRODUCTION READY
+✅ **19 methods implemented** including full callback system
+✅ **Event-driven architecture** working perfectly  
+✅ **Real frame reception** tested and confirmed
+✅ **Auto-initialization** and robust error handling
+✅ **Enhanced diagnostics** for debugging and monitoring
 
-### Pin Configurations
-Standard test setup assumes specific pins - verify hardware connections before debugging software issues.
-
-## When Modifying Code
-
-### Adding New Python Methods
-1. Implement C function in `moddw1000.c`
-2. Add to `dw1000_locals_dict` table
-3. Rebuild firmware with USER_C_MODULES
-4. Test with `mpremote` on hardware
-
-### Driver Integration
-The DW1000 driver is external - modifications should go in the HAL layer or wrapper, not in `dw1000-driver/` files.
-
-### Debugging Hardware Issues
-1. Verify SPI communication with `read_device_id()`
-2. Check pin connections and power supply
-3. Use oscilloscope for SPI signal verification
-4. Compare working vs failing register states
-
-Always test changes on actual hardware - the DW1000 driver requires real hardware communication patterns that can't be simulated.
+The module provides **professional-grade UWB development** with both polling and event-driven patterns.
