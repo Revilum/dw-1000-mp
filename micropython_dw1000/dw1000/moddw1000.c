@@ -20,16 +20,31 @@
 #include "py/mphal.h"
 #include "extmod/modmachine.h"
 
+// Pico SDK GPIO includes for C-level IRQ handling
+#include "hardware/gpio.h"
+#include "hardware/irq.h"
+
+// Include machine pin header for accessing GPIO number
+#include "machine_pin.h"
+
 // Define STATIC if not already defined
 #ifndef STATIC
 #define STATIC static
 #endif
 
-#include "dw1000_hal.h"
-
-// Include the DW1000 driver
+// DW1000 driver and HAL includes
 #include "../../dw1000-driver/deca_device_api.h"
 #include "../../dw1000-driver/deca_regs.h"
+#include "dw1000_hal.h"
+
+// Forward declarations for C callback functions
+STATIC void c_callback_rx_ok(const dwt_cb_data_t *cb_data);
+STATIC void c_callback_tx_done(const dwt_cb_data_t *cb_data);
+STATIC void c_callback_rx_to(const dwt_cb_data_t *cb_data);
+STATIC void c_callback_rx_err(const dwt_cb_data_t *cb_data);
+
+// Global pointer to current DW1000 object for C callbacks
+STATIC dw1000_obj_t *current_dw1000_obj = NULL;
 
 // Custom RX state definitions (not in driver header)
 #define SYS_STATE_RX_STATE      0x0000000FUL    /* RX State mask */
@@ -67,6 +82,14 @@ STATIC mp_obj_t dw1000_make_new(const mp_obj_type_t *type, size_t n_args, size_t
     self->irq_pin = (n_args > 3) ? args[3] : MP_OBJ_NULL;    // IRQ pin (optional)
     self->initialized = false;
     
+    // Initialize callbacks to None
+    self->rx_callback = mp_const_none;
+    self->tx_callback = mp_const_none;
+    self->error_callback = mp_const_none;
+    self->timeout_callback = mp_const_none;
+    self->auto_rx = false;
+    self->irq_enabled = false;
+    
     return MP_OBJ_FROM_PTR(self);
 }
 
@@ -75,12 +98,24 @@ STATIC mp_obj_t dw1000_make_new(const mp_obj_type_t *type, size_t n_args, size_t
  *
  * @brief Initialize the DW1000 device with comprehensive setup (based on Polypoint)
  */
-STATIC mp_obj_t dw1000_init(mp_obj_t self_in) {
-    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+STATIC mp_obj_t dw1000_init(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_auto_rx };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_auto_rx, MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = false} },
+    };
+
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(pos_args[0]);
+    
+    // Parse arguments
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
     
     if (self->initialized) {
         return mp_const_true;
     }
+    
+    // Set auto_rx mode from arguments
+    self->auto_rx = args[ARG_auto_rx].u_bool;
     
     // Initialize HAL
     dw1000_hal_init(self);
@@ -147,10 +182,13 @@ STATIC mp_obj_t dw1000_init(mp_obj_t self_in) {
                     DWT_INT_SFDT |    // SFD timeout
                     DWT_INT_ARFE, 1); // Frame filtering rejection
 
+    // Register C callbacks with the lab11 driver
+    dwt_setcallbacks(c_callback_tx_done, c_callback_rx_ok, c_callback_rx_to, c_callback_rx_err);
+
     self->initialized = true;
     return mp_const_true;
 }
-STATIC MP_DEFINE_CONST_FUN_OBJ_1(dw1000_init_obj, dw1000_init);
+STATIC MP_DEFINE_CONST_FUN_OBJ_KW(dw1000_init_obj, 1, dw1000_init);
 
 /*! ------------------------------------------------------------------------------------------------------------------
  * @fn dw1000_deinit()
@@ -187,47 +225,47 @@ STATIC MP_DEFINE_CONST_FUN_OBJ_1(dw1000_read_device_id_obj, dw1000_read_device_i
 /*! ------------------------------------------------------------------------------------------------------------------
  * @fn dw1000_configure()
  *
- * @brief Configure the DW1000 device
+ * @brief Configure the DW1000 device with keyword arguments
  */
-STATIC mp_obj_t dw1000_configure(size_t n_args, const mp_obj_t *args) {
-    dw1000_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+STATIC mp_obj_t dw1000_configure(size_t n_args, const mp_obj_t *pos_args, mp_map_t *kw_args) {
+    enum { ARG_channel, ARG_prf, ARG_tx_preamble_length, ARG_rx_pac, ARG_tx_code, ARG_rx_code, 
+           ARG_non_standard_sfd, ARG_data_rate, ARG_phr_mode, ARG_sfd_timeout };
+    static const mp_arg_t allowed_args[] = {
+        { MP_QSTR_channel,              MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 5} },
+        { MP_QSTR_prf,                  MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = DWT_PRF_64M} },
+        { MP_QSTR_tx_preamble_length,   MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = DWT_PLEN_128} },
+        { MP_QSTR_rx_pac,               MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = DWT_PAC8} },
+        { MP_QSTR_tx_code,              MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 9} },
+        { MP_QSTR_rx_code,              MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = 9} },
+        { MP_QSTR_non_standard_sfd,     MP_ARG_KW_ONLY | MP_ARG_BOOL, {.u_bool = true} },
+        { MP_QSTR_data_rate,            MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = DWT_BR_6M8} },
+        { MP_QSTR_phr_mode,             MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = DWT_PHRMODE_STD} },
+        { MP_QSTR_sfd_timeout,          MP_ARG_KW_ONLY | MP_ARG_INT, {.u_int = (128 + 1 + 8 - 8)} },
+    };
+
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(pos_args[0]);
     
     if (!self->initialized) {
         mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
     }
     
-    // Default configuration (matching dw1000_init for consistency)
-    dwt_config_t config = {
-        .chan = 5,                  // Channel 5 (consistent with dw1000_init)
-        .prf = DWT_PRF_64M,        // 64 MHz PRF
-        .txPreambLength = DWT_PLEN_128, // 128 preamble length
-        .rxPAC = DWT_PAC8,         // PAC size 8
-        .txCode = 9,               // TX preamble code
-        .rxCode = 9,               // RX preamble code
-        .nsSFD = 1,                // Non-standard SFD (matching dw1000_init)
-        .dataRate = DWT_BR_6M8,    // 6.8 Mbps
-        .phrMode = DWT_PHRMODE_STD, // Standard PHR mode
-        .sfdTO = (128 + 1 + 8 - 8) // SFD timeout (matching dw1000_init)
-    };
+    // Parse arguments
+    mp_arg_val_t args[MP_ARRAY_SIZE(allowed_args)];
+    mp_arg_parse_all(n_args - 1, pos_args + 1, kw_args, MP_ARRAY_SIZE(allowed_args), allowed_args, args);
     
-    // Override with provided arguments if any
-    if (n_args > 1) {
-        // Parse configuration dictionary if provided
-        if (mp_obj_is_type(args[1], &mp_type_dict)) {
-            mp_obj_dict_t *dict = MP_OBJ_TO_PTR(args[1]);
-            
-            // Extract configuration parameters from dictionary
-            mp_obj_t value = mp_obj_dict_get(MP_OBJ_FROM_PTR(dict), MP_OBJ_NEW_QSTR(MP_QSTR_channel));
-            if (value != MP_OBJ_NULL) {
-                config.chan = mp_obj_get_int(value);
-            }
-            value = mp_obj_dict_get(MP_OBJ_FROM_PTR(dict), MP_OBJ_NEW_QSTR(MP_QSTR_data_rate));
-            if (value != MP_OBJ_NULL) {
-                config.dataRate = mp_obj_get_int(value);
-            }
-            // Add more configuration parameters as needed
-        }
-    }
+    // Build configuration structure
+    dwt_config_t config = {
+        .chan = args[ARG_channel].u_int,
+        .prf = args[ARG_prf].u_int,
+        .txPreambLength = args[ARG_tx_preamble_length].u_int,
+        .rxPAC = args[ARG_rx_pac].u_int,
+        .txCode = args[ARG_tx_code].u_int,
+        .rxCode = args[ARG_rx_code].u_int,
+        .nsSFD = args[ARG_non_standard_sfd].u_bool ? 1 : 0,
+        .dataRate = args[ARG_data_rate].u_int,
+        .phrMode = args[ARG_phr_mode].u_int,
+        .sfdTO = args[ARG_sfd_timeout].u_int
+    };
     
     // Apply configuration
     dwt_configure(&config);
@@ -258,7 +296,7 @@ STATIC mp_obj_t dw1000_configure(size_t n_args, const mp_obj_t *args) {
     
     return mp_const_none;
 }
-STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(dw1000_configure_obj, 1, 2, dw1000_configure);
+STATIC MP_DEFINE_CONST_FUN_OBJ_KW(dw1000_configure_obj, 1, dw1000_configure);
 
 /*! ------------------------------------------------------------------------------------------------------------------
  * @fn dw1000_tx_frame()
@@ -536,6 +574,321 @@ STATIC mp_obj_t dw1000_read_register(mp_obj_t self_in, mp_obj_t reg_id_obj) {
 STATIC MP_DEFINE_CONST_FUN_OBJ_2(dw1000_read_register_obj, dw1000_read_register);
 
 /*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_set_rx_callback()
+ *
+ * @brief Set callback function for RX events
+ */
+STATIC mp_obj_t dw1000_set_rx_callback(mp_obj_t self_in, mp_obj_t callback) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    self->rx_callback = callback;
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_2(dw1000_set_rx_callback_obj, dw1000_set_rx_callback);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_set_tx_callback()
+ *
+ * @brief Set callback function for TX events
+ */
+STATIC mp_obj_t dw1000_set_tx_callback(mp_obj_t self_in, mp_obj_t callback) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    self->tx_callback = callback;
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_2(dw1000_set_tx_callback_obj, dw1000_set_tx_callback);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_set_error_callback()
+ *
+ * @brief Set callback function for error events
+ */
+STATIC mp_obj_t dw1000_set_error_callback(mp_obj_t self_in, mp_obj_t callback) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    self->error_callback = callback;
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_2(dw1000_set_error_callback_obj, dw1000_set_error_callback);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_set_timeout_callback()
+ *
+ * @brief Set callback function for timeout events
+ */
+STATIC mp_obj_t dw1000_set_timeout_callback(mp_obj_t self_in, mp_obj_t callback) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    self->timeout_callback = callback;
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_2(dw1000_set_timeout_callback_obj, dw1000_set_timeout_callback);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_set_auto_rx()
+ *
+ * @brief Enable/disable automatic RX re-enable mode
+ */
+STATIC mp_obj_t dw1000_set_auto_rx(mp_obj_t self_in, mp_obj_t enable_obj) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    self->auto_rx = mp_obj_is_true(enable_obj);
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_2(dw1000_set_auto_rx_obj, dw1000_set_auto_rx);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_process_events()
+ *
+ * @brief Process DW1000 events using the lab11 driver's ISR - NO manual register access
+ */
+STATIC mp_obj_t dw1000_process_events(mp_obj_t self_in) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    // Set global pointer for C callbacks
+    current_dw1000_obj = self;
+    
+    // Use lab11 driver's ISR - it handles ALL register access, status checking, and recovery
+    dwt_isr();
+    
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_1(dw1000_process_events_obj, dw1000_process_events);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_micropython_irq_handler()
+ *
+ * @brief MicroPython-compatible IRQ handler that gets called from Pin.irq() system
+ * This provides fast hardware IRQ response while maintaining MicroPython compatibility
+ */
+STATIC mp_obj_t dw1000_micropython_irq_handler(mp_obj_t pin_obj) {
+    // This gets called from MicroPython's Pin.irq() system
+    // Immediately process DW1000 events without Python overhead
+    if (current_dw1000_obj && current_dw1000_obj->irq_enabled) {
+        // Process events directly - this is as fast as direct C IRQ
+        dw1000_process_events(current_dw1000_obj);
+    }
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_1(dw1000_micropython_irq_handler_obj, dw1000_micropython_irq_handler);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_enable_irq()
+ *
+ * @brief Enable hardware IRQ using MicroPython Pin.irq() system for compatibility
+ */
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_c_irq_handler()
+ *
+ * @brief C-level IRQ handler for DW1000 interrupt pin - called directly from hardware interrupt
+ * This is much more efficient than Python IRQ handlers!
+ */
+void dw1000_c_irq_handler(uint gpio, uint32_t events) {
+    // Only handle our specific IRQ pin and falling edge events
+    if (current_dw1000_obj && 
+        current_dw1000_obj->irq_enabled && 
+        (events & GPIO_IRQ_EDGE_FALL)) {
+        
+        // Get the GPIO number from Pin object for comparison
+        const machine_pin_obj_t *pin = MP_OBJ_TO_PTR(current_dw1000_obj->irq_pin);
+        uint expected_gpio = pin->id;
+        
+        // Only process if this is our GPIO pin
+        if (gpio != expected_gpio) {
+            return;
+        }
+        
+        // PolyPoint pattern: Keep calling dwt_isr() until IRQ pin goes low
+        // Add escape hatch to prevent infinite loops
+        uint8_t count = 0;
+        do {
+            // Process DW1000 events using lab11 driver
+            dwt_isr();
+            count++;
+        } while (dw1000_irq_pin_read(current_dw1000_obj) && count < 10);
+        
+        // Note: Python callbacks are called from dwt_isr() → our C callbacks
+        // This happens automatically through the lab11 driver callback system
+    }
+}
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_enable_irq()
+ *
+ * @brief Enable IRQ pin interrupt handling for automatic event processing
+ */
+STATIC mp_obj_t dw1000_enable_irq(mp_obj_t self_in) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    if (self->irq_pin == MP_OBJ_NULL) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("IRQ pin not configured"));
+    }
+    
+    // For now, just set the internal state
+    // The actual Pin.irq() setup will be done in Python using get_irq_handler()
+    const machine_pin_obj_t *pin = MP_OBJ_TO_PTR(self->irq_pin);
+    uint gpio_pin = pin->id;
+    
+    // Set global pointer and enable flag
+    current_dw1000_obj = self;
+    self->irq_enabled = true;
+    
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_1(dw1000_enable_irq_obj, dw1000_enable_irq);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_disable_irq()
+ *
+ * @brief Disable IRQ pin interrupt handling
+ */
+STATIC mp_obj_t dw1000_disable_irq(mp_obj_t self_in) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    if (self->irq_pin == MP_OBJ_NULL) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("IRQ pin not configured"));
+    }
+    
+    // Clear flags - the actual Pin.irq(handler=None) will be done in Python
+    self->irq_enabled = false;
+    if (current_dw1000_obj == self) {
+        current_dw1000_obj = NULL;
+    }
+    
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_1(dw1000_disable_irq_obj, dw1000_disable_irq);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_get_irq_handler()
+ *
+ * @brief Get the C-level IRQ handler function for use with Pin.irq()
+ */
+STATIC mp_obj_t dw1000_get_irq_handler(mp_obj_t self_in) {
+    return MP_OBJ_FROM_PTR(&dw1000_micropython_irq_handler_obj);
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_1(dw1000_get_irq_handler_obj, dw1000_get_irq_handler);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * C callback functions for lab11 driver - called by dwt_isr()
+ */
+
+STATIC void c_callback_rx_ok(const dwt_cb_data_t *cb_data) {
+    if (!current_dw1000_obj || current_dw1000_obj->rx_callback == mp_const_none) {
+        goto auto_rx_check;
+    }
+    
+    // Create frame info dictionary using data provided by lab11 driver
+    mp_obj_t frame_info = mp_obj_new_dict(6);
+    mp_obj_dict_store(frame_info, MP_OBJ_NEW_QSTR(MP_QSTR_event), MP_OBJ_NEW_QSTR(MP_QSTR_rx_good));
+    mp_obj_dict_store(frame_info, MP_OBJ_NEW_QSTR(MP_QSTR_status), mp_obj_new_int_from_uint(cb_data->status));
+    
+    // Calculate payload length (lab11 datalength includes 2-byte CRC, so subtract it)
+    // This matches the logic in read_rx_data() function
+    uint16_t payload_len = (cb_data->datalength > 2) ? (cb_data->datalength - 2) : 0;
+    mp_obj_dict_store(frame_info, MP_OBJ_NEW_QSTR(MP_QSTR_length), mp_obj_new_int(payload_len));
+    
+    // Read frame data using lab11 driver function (excluding CRC)
+    mp_obj_t data_obj = mp_const_none;
+    if (payload_len > 0 && payload_len <= 125) {
+        uint8_t *buffer = m_new(uint8_t, payload_len);
+        dwt_readrxdata(buffer, payload_len, 0);  // Read only payload, not CRC
+        data_obj = mp_obj_new_bytes(buffer, payload_len);
+        m_del(uint8_t, buffer, payload_len);
+    }
+    mp_obj_dict_store(frame_info, MP_OBJ_NEW_QSTR(MP_QSTR_data), data_obj);
+    
+    // Add timestamps (could use dwt_readrxtimestamp() here)
+    mp_obj_dict_store(frame_info, MP_OBJ_NEW_QSTR(MP_QSTR_timestamp), mp_obj_new_int(0));
+    mp_obj_dict_store(frame_info, MP_OBJ_NEW_QSTR(MP_QSTR_rx_time_ms), mp_obj_new_int(mp_hal_ticks_ms()));
+    
+    // Call Python callback
+    mp_call_function_1(current_dw1000_obj->rx_callback, frame_info);
+    
+auto_rx_check:
+    // Auto RX re-enable if configured
+    if (current_dw1000_obj && current_dw1000_obj->auto_rx) {
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    }
+}
+
+STATIC void c_callback_tx_done(const dwt_cb_data_t *cb_data) {
+    if (!current_dw1000_obj || current_dw1000_obj->tx_callback == mp_const_none) {
+        return;
+    }
+    
+    mp_obj_t tx_info = mp_obj_new_dict(2);
+    mp_obj_dict_store(tx_info, MP_OBJ_NEW_QSTR(MP_QSTR_event), MP_OBJ_NEW_QSTR(MP_QSTR_tx_complete));
+    mp_obj_dict_store(tx_info, MP_OBJ_NEW_QSTR(MP_QSTR_status), mp_obj_new_int_from_uint(cb_data->status));
+    mp_call_function_1(current_dw1000_obj->tx_callback, tx_info);
+}
+
+STATIC void c_callback_rx_to(const dwt_cb_data_t *cb_data) {
+    if (!current_dw1000_obj || current_dw1000_obj->timeout_callback == mp_const_none) {
+        goto auto_rx_check;
+    }
+    
+    mp_call_function_0(current_dw1000_obj->timeout_callback);
+    
+auto_rx_check:
+    // Auto RX re-enable (dwt_isr already did the reset)
+    if (current_dw1000_obj && current_dw1000_obj->auto_rx) {
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    }
+}
+
+STATIC void c_callback_rx_err(const dwt_cb_data_t *cb_data) {
+    if (!current_dw1000_obj || current_dw1000_obj->error_callback == mp_const_none) {
+        goto auto_rx_check;
+    }
+    
+    mp_obj_t error_info = mp_obj_new_dict(2);
+    mp_obj_dict_store(error_info, MP_OBJ_NEW_QSTR(MP_QSTR_event), MP_OBJ_NEW_QSTR(MP_QSTR_rx_error));
+    mp_obj_dict_store(error_info, MP_OBJ_NEW_QSTR(MP_QSTR_status), mp_obj_new_int_from_uint(cb_data->status));
+    mp_call_function_1(current_dw1000_obj->error_callback, error_info);
+    
+auto_rx_check:
+    // Auto RX re-enable (dwt_isr already did the reset)
+    if (current_dw1000_obj && current_dw1000_obj->auto_rx) {
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+    }
+}
+
+/*! ------------------------------------------------------------------------------------------------------------------
  * @fn dw1000_print()
  *
  * @brief Print function for DW1000 objects
@@ -564,6 +917,17 @@ STATIC const mp_rom_map_elem_t dw1000_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_get_sys_state), MP_ROM_PTR(&dw1000_get_sys_state_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_rx_finfo), MP_ROM_PTR(&dw1000_get_rx_finfo_obj) },
     { MP_ROM_QSTR(MP_QSTR_read_register), MP_ROM_PTR(&dw1000_read_register_obj) },
+    // Callback functions
+    { MP_ROM_QSTR(MP_QSTR_set_rx_callback), MP_ROM_PTR(&dw1000_set_rx_callback_obj) },
+    { MP_ROM_QSTR(MP_QSTR_set_tx_callback), MP_ROM_PTR(&dw1000_set_tx_callback_obj) },
+    { MP_ROM_QSTR(MP_QSTR_set_error_callback), MP_ROM_PTR(&dw1000_set_error_callback_obj) },
+    { MP_ROM_QSTR(MP_QSTR_set_timeout_callback), MP_ROM_PTR(&dw1000_set_timeout_callback_obj) },
+    { MP_ROM_QSTR(MP_QSTR_process_events), MP_ROM_PTR(&dw1000_process_events_obj) },
+    { MP_ROM_QSTR(MP_QSTR_set_auto_rx), MP_ROM_PTR(&dw1000_set_auto_rx_obj) },
+    // IRQ functions
+    { MP_ROM_QSTR(MP_QSTR_enable_irq), MP_ROM_PTR(&dw1000_enable_irq_obj) },
+    { MP_ROM_QSTR(MP_QSTR_disable_irq), MP_ROM_PTR(&dw1000_disable_irq_obj) },
+    { MP_ROM_QSTR(MP_QSTR_get_irq_handler), MP_ROM_PTR(&dw1000_get_irq_handler_obj) },
 };
 STATIC MP_DEFINE_CONST_DICT(dw1000_locals_dict, dw1000_locals_dict_table);
 
@@ -592,6 +956,30 @@ STATIC const mp_rom_map_elem_t dw1000_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_BR_110K), MP_ROM_INT(DWT_BR_110K) },
     { MP_ROM_QSTR(MP_QSTR_BR_850K), MP_ROM_INT(DWT_BR_850K) },
     { MP_ROM_QSTR(MP_QSTR_BR_6M8), MP_ROM_INT(DWT_BR_6M8) },
+    
+    // PRF (Pulse Repetition Frequency)
+    { MP_ROM_QSTR(MP_QSTR_PRF_16M), MP_ROM_INT(DWT_PRF_16M) },
+    { MP_ROM_QSTR(MP_QSTR_PRF_64M), MP_ROM_INT(DWT_PRF_64M) },
+    
+    // TX Preamble Lengths
+    { MP_ROM_QSTR(MP_QSTR_PLEN_64), MP_ROM_INT(DWT_PLEN_64) },
+    { MP_ROM_QSTR(MP_QSTR_PLEN_128), MP_ROM_INT(DWT_PLEN_128) },
+    { MP_ROM_QSTR(MP_QSTR_PLEN_256), MP_ROM_INT(DWT_PLEN_256) },
+    { MP_ROM_QSTR(MP_QSTR_PLEN_512), MP_ROM_INT(DWT_PLEN_512) },
+    { MP_ROM_QSTR(MP_QSTR_PLEN_1024), MP_ROM_INT(DWT_PLEN_1024) },
+    { MP_ROM_QSTR(MP_QSTR_PLEN_1536), MP_ROM_INT(DWT_PLEN_1536) },
+    { MP_ROM_QSTR(MP_QSTR_PLEN_2048), MP_ROM_INT(DWT_PLEN_2048) },
+    { MP_ROM_QSTR(MP_QSTR_PLEN_4096), MP_ROM_INT(DWT_PLEN_4096) },
+    
+    // RX PAC (Preamble Acquisition Chunk) sizes
+    { MP_ROM_QSTR(MP_QSTR_PAC8), MP_ROM_INT(DWT_PAC8) },
+    { MP_ROM_QSTR(MP_QSTR_PAC16), MP_ROM_INT(DWT_PAC16) },
+    { MP_ROM_QSTR(MP_QSTR_PAC32), MP_ROM_INT(DWT_PAC32) },
+    { MP_ROM_QSTR(MP_QSTR_PAC64), MP_ROM_INT(DWT_PAC64) },
+    
+    // PHR Modes
+    { MP_ROM_QSTR(MP_QSTR_PHRMODE_STD), MP_ROM_INT(DWT_PHRMODE_STD) },
+    { MP_ROM_QSTR(MP_QSTR_PHRMODE_EXT), MP_ROM_INT(DWT_PHRMODE_EXT) },
     
     // Channels
     { MP_ROM_QSTR(MP_QSTR_CHANNEL_1), MP_ROM_INT(1) },

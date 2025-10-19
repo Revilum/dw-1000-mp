@@ -28,6 +28,14 @@ typedef struct _dw1000_obj_t {
     mp_obj_t reset_pin;     // Reset pin (optional)
     mp_obj_t irq_pin;       // IRQ pin (optional)
     bool initialized;       // Initialization state
+    
+    // Callback function storage
+    mp_obj_t rx_callback;      // RX frame callback
+    mp_obj_t tx_callback;      // TX complete callback  
+    mp_obj_t error_callback;   // Error callback
+    mp_obj_t timeout_callback; // Timeout callback
+    bool auto_rx;              // Auto RX re-enable mode
+    bool irq_enabled;          // IRQ handler enabled state
 } dw1000_obj_t;
 
 // HAL function declarations - these implement the platform-specific functions

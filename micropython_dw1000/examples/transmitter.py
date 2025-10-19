@@ -32,19 +32,16 @@ def main():
     irq_pin = machine.Pin(IRQ_PIN, machine.Pin.IN)
     
     try:
-        # Initialize DW1000 (auto-init enabled)
+        # Initialize DW1000
         dwt = dw1000.DW1000(spi, cs_pin, reset_pin, irq_pin)
+        dwt.init()
         
         # Verify device
         device_id = dwt.read_device_id()
         print(f"✅ Device ID: 0x{device_id:08X}")
         
-        # Configure for reliable transmission
-        config = {
-            'channel': 2,
-            'data_rate': dw1000.BR_850K  # 850 kbps for best reliability
-        }
-        dwt.configure(config)
+        # Configure for reliable transmission (new keyword argument syntax)
+        dwt.configure(channel=2, data_rate=dw1000.BR_850K)  # 850 kbps for best reliability
         print("✅ Device configured")
         
         # Transmission loop

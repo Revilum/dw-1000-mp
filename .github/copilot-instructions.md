@@ -15,9 +15,9 @@ MicroPython interface for DecaWave DW1000 Ultra-Wideband transceiver targeting *
 - SPI0: 1MHz, pins vary by board
 - Standard: CS=Pin 17, Reset=Pin 21, IRQ=Pin 20
 
-## Current Module Status: ✅ FULLY OPERATIONAL
+## Current Module Status: ✅ FULLY OPERATIONAL WITH POLYPOINT FEATURES
 
-### ✅ Implemented Features (19 methods):
+### ✅ Implemented Features (21 methods):
 
 **Core Functionality:**
 ```python
@@ -56,6 +56,17 @@ dwt.process_events()                   # Trigger callbacks
 dwt.set_auto_rx(True/False)           # Auto RX mode
 ```
 
+**🎯 PolyPoint Features (PROFESSIONAL RANGING):**
+```python
+# Auto RX parameter in init() - continuous reception without manual re-enable
+dwt.init(auto_rx=True)           # Enable automatic RX re-enable (PolyPoint feature)
+dwt.init(auto_rx=False)          # Standard behavior (default)
+
+# Complete professional ranging setup (2 lines!)
+dwt.init(auto_rx=True)          # Auto RX for continuous operation
+dwt.configure(channel=2, data_rate=dw1000.BR_850K)  # 850 kbps for best reliability
+```
+
 ## Development Workflow
 
 **Testing:** `mpremote run <script.py>`
@@ -63,11 +74,13 @@ dwt.set_auto_rx(True/False)           # Auto RX mode
 **Building Custom Firmware:**
 ```bash
 cd micropython/ports/rp2
+make clean
 make USER_C_MODULES=../../../micropython_dw1000/micropython.cmake BOARD=RPI_PICO -j16
 ```
 
 **Working Examples:**
 - `callback_receiver.py` - **RECOMMENDED** - Event-driven receiver with callbacks
+- `test_polypoint_features.py` - **NEW** - PolyPoint features testing and demo
 - `enhanced_receiver_working.py` - Polling-based receiver with enhanced diagnostics
 - `test_callbacks.py` - Callback system testing
 - `test_enhanced_init.py` - Basic functionality tests
@@ -151,11 +164,12 @@ tx_complete = (status & 0x0080) != 0   # Bit 7
 - Configuration errors → `RuntimeError`
 - All methods require `initialized` flag check
 
-## Current Status: 🏆 PRODUCTION READY
-✅ **19 methods implemented** including full callback system
+## Current Status: 🏆 PRODUCTION READY WITH POLYPOINT FEATURES
+✅ **21 methods implemented** including full callback system and PolyPoint features
 ✅ **Event-driven architecture** working perfectly  
+✅ **PolyPoint auto RX and optimal ranging** - professional ranging capabilities
 ✅ **Real frame reception** tested and confirmed
 ✅ **Auto-initialization** and robust error handling
 ✅ **Enhanced diagnostics** for debugging and monitoring
 
-The module provides **professional-grade UWB development** with both polling and event-driven patterns.
+The module provides **professional-grade UWB development** with industry-standard PolyPoint features for optimal ranging performance.

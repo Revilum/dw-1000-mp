@@ -15,7 +15,7 @@ This module provides a complete MicroPython interface to the DW1000 UWB transcei
 
 - **🔥 Event-Driven Architecture**: Full callback system for non-blocking operation
 - **🛡️ Robust Error Recovery**: Automatic timeout and error state management
-- **⚡ Auto-Initialization**: Plug-and-play device setup
+- **⚡ Simple Initialization**: Easy device setup with clear error handling
 - **🔍 Enhanced Diagnostics**: Real-time register access and frame analysis
 - **🏗️ Lab11 Driver Integration**: Uses proven, stable DW1000 driver
 - **📡 19 Python Methods**: Complete API coverage for UWB development
@@ -24,7 +24,7 @@ This module provides a complete MicroPython interface to the DW1000 UWB transcei
 
 ✅ **Full callback system** working with real frame reception  
 ✅ **Event-driven architecture** tested and stable  
-✅ **Auto-initialization** with robust error handling  
+✅ **Clear initialization process** with robust error handling  
 ✅ **Enhanced diagnostics** for development and debugging  
 ✅ **Cross-device communication** verified at 850K data rate
 
@@ -42,7 +42,7 @@ This module provides a complete MicroPython interface to the DW1000 UWB transcei
 ```
 micropython_dw1000/
 ├── dw1000/                     # Main module directory
-│   ├── moddw1000.c             # MicroPython C module (auto-init + callbacks)
+│   ├── moddw1000.c             # MicroPython C module (callbacks + configuration)
 │   ├── dw1000_hal.c            # Hardware Abstraction Layer
 │   ├── dw1000_hal.h            # HAL header with callback support
 │   ├── micropython.mk          # Make build configuration
@@ -102,7 +102,7 @@ cp build-RPI_PICO/firmware.uf2 /media/user/RPI-RP2/
 
 ## Quick Start
 
-### Basic Setup with Auto-Initialization
+### Basic Setup
 
 ```python
 import machine
@@ -115,19 +115,16 @@ cs_pin = machine.Pin(17, machine.Pin.OUT)
 reset_pin = machine.Pin(21, machine.Pin.OUT)  # Recommended
 irq_pin = machine.Pin(20, machine.Pin.IN)     # Recommended
 
-# Create DW1000 instance with auto-initialization
+# Create DW1000 instance and initialize
 dwt = dw1000.DW1000(spi, cs_pin, reset_pin, irq_pin)
+dwt.init()  # Initialize the device
 
 # Verify connection
 device_id = dwt.read_device_id()
 print(f"Device ID: 0x{device_id:08X}")  # Should show 0xDECA0130
 
-# Configure for operation
-config = {
-    'channel': 2,
-    'data_rate': dw1000.BR_850K  # Recommended for reliability
-}
-dwt.configure(config)
+# Configure for operation (new keyword argument syntax)
+dwt.configure(channel=2, data_rate=dw1000.BR_850K)  # Recommended for reliability
 ```
 
 ### Event-Driven Receiver (Recommended)
@@ -212,23 +209,57 @@ if device_id == 0xDECA0130:
 
 ---
 
-#### `configure(config)`
-Configure the DW1000 with specified parameters.
+#### `configure(**kwargs)`
+Configure the DW1000 with keyword arguments for all configuration parameters.
 
-**Parameters:**
-- `config`: `dict` - Configuration parameters
+**Parameters (all optional with smart defaults):**
+- `channel`: `int` - UWB channel (1-7), default: 5
+- `prf`: `int` - Pulse Repetition Frequency (PRF_16M, PRF_64M), default: PRF_64M  
+- `tx_preamble_length`: `int` - TX preamble length, default: PLEN_128
+- `rx_pac`: `int` - RX Preamble Acquisition Chunk size, default: PAC8
+- `tx_code`: `int` - TX preamble code (1-20), default: 9
+- `rx_code`: `int` - RX preamble code (1-20), default: 9
+- `non_standard_sfd`: `bool` - Use non-standard SFD, default: True
+- `data_rate`: `int` - Data rate (BR_110K, BR_850K, BR_6M8), default: BR_6M8
+- `phr_mode`: `int` - PHR mode (PHRMODE_STD, PHRMODE_EXT), default: PHRMODE_STD
+- `sfd_timeout`: `int` - SFD timeout in symbols, default: 129
 
-**Configuration Keys:**
-- `'channel'`: `int` - UWB channel (1-7), default: 2
-- `'data_rate'`: `int` - Data rate constant (BR_110K, BR_850K, BR_6M8)
+**Examples:**
 
-**Example:**
+**Basic configuration (recommended for most applications):**
 ```python
-config = {
-    'channel': 2,
-    'data_rate': dw1000.BR_850K
-}
-dwt.configure(config)
+# Simple reliable configuration
+dwt.configure(channel=2, data_rate=dw1000.BR_850K)
+```
+
+**High-performance ranging configuration:**
+```python
+# Optimized for precision ranging
+dwt.configure(
+    channel=2,
+    prf=dw1000.PRF_64M,
+    tx_preamble_length=dw1000.PLEN_128,
+    data_rate=dw1000.BR_6M8,
+    non_standard_sfd=True
+)
+```
+
+**Long-range configuration:**
+```python
+# Maximize range with slower data rate
+dwt.configure(
+    channel=1,
+    prf=dw1000.PRF_16M,
+    tx_preamble_length=dw1000.PLEN_1024,
+    rx_pac=dw1000.PAC32,
+    data_rate=dw1000.BR_110K
+)
+```
+
+**Default configuration (called with no parameters):**
+```python
+# Uses optimal ranging settings (PolyPoint-style)
+dwt.configure()  # Channel 5, 64MHz PRF, 128 preamble, 6.8M data rate
 ```
 
 ---
@@ -512,6 +543,38 @@ dw1000.BR_850K    # 850 kbps (recommended - best reliability)
 dw1000.BR_6M8     # 6.8 Mbps (high speed)
 ```
 
+#### Pulse Repetition Frequency (PRF)
+```python
+dw1000.PRF_16M    # 16 MHz PRF (longer range)
+dw1000.PRF_64M    # 64 MHz PRF (better precision)
+```
+
+#### TX Preamble Lengths
+```python
+dw1000.PLEN_64      # 64 symbols
+dw1000.PLEN_128     # 128 symbols (default)
+dw1000.PLEN_256     # 256 symbols
+dw1000.PLEN_512     # 512 symbols
+dw1000.PLEN_1024    # 1024 symbols
+dw1000.PLEN_1536    # 1536 symbols
+dw1000.PLEN_2048    # 2048 symbols
+dw1000.PLEN_4096    # 4096 symbols
+```
+
+#### RX Preamble Acquisition Chunk (PAC) Sizes
+```python
+dw1000.PAC8     # 8 symbols (for preambles ≤128)
+dw1000.PAC16    # 16 symbols (for preamble 256)
+dw1000.PAC32    # 32 symbols (for preamble 512)
+dw1000.PAC64    # 64 symbols (for preambles ≥1024)
+```
+
+#### PHR Modes
+```python
+dw1000.PHRMODE_STD    # Standard IEEE 802.15.4 PHR
+dw1000.PHRMODE_EXT    # Extended DW1000-specific PHR
+```
+
 #### Device Information
 ```python
 dw1000.DEVICE_ID  # Expected device ID: 0xDECA0130
@@ -521,12 +584,12 @@ dw1000.DEVICE_ID  # Expected device ID: 0xDECA0130
 
 ### Class Behavior and Error Recovery
 
-#### Auto-Initialization
-The DW1000 class **automatically initializes** the device in the constructor:
-- Loads microcode and configurations
-- Sets up default parameters  
-- Verifies device communication
-- Ready for immediate use after construction
+#### Initialization Process
+The DW1000 class requires explicit initialization after object creation:
+- Constructor creates the object and sets up pin assignments
+- `init()` method loads microcode and configurations
+- Sets up default parameters and verifies device communication
+- Device ready for use after successful `init()` call
 
 #### Error Handling Philosophy
 - **Hardware errors** → `OSError(MP_EIO)` - SPI communication failures
@@ -610,31 +673,223 @@ INVALID_DEVICE_ID  = 0x00000000  # Communication failure
 
 ---
 
-## Configuration Parameters
+## 🔧 Complete Configuration Parameters Guide
+
+The `configure()` method accepts keyword arguments for comprehensive DW1000 configuration. All parameters are optional with intelligent defaults optimized for reliable operation.
 
 ### Channel Configuration
 ```python
-# Supported UWB channels (1-7)
-CHANNEL_1 = 1   # 3494.4 MHz
-CHANNEL_2 = 2   # 3993.6 MHz (recommended)
-CHANNEL_3 = 3   # 4492.8 MHz  
-CHANNEL_4 = 4   # 3993.6 MHz
-CHANNEL_5 = 5   # 6489.6 MHz
-CHANNEL_6 = 6   # 6988.8 MHz
-CHANNEL_7 = 7   # 6489.6 MHz
+# Supported UWB channels (1-7) with center frequencies
+channel=1   # 3494.4 MHz - European band
+channel=2   # 3993.6 MHz - Global band (recommended for reliability)  
+channel=3   # 4492.8 MHz - Global band
+channel=4   # 3993.6 MHz - Global band (same frequency as channel 2)
+channel=5   # 6489.6 MHz - Global band (default - good performance)
+channel=7   # 6489.6 MHz - Global band (same frequency as channel 5)
 
-# Default configuration
-default_config = {
-    'channel': 2,           # Channel 2 (3993.6 MHz)
-    'data_rate': BR_850K    # 850 kbps (best reliability)
-}
+# Usage examples
+dwt.configure(channel=2)  # Reliable global frequency
+dwt.configure(channel=5)  # Default high-performance frequency
 ```
 
-### Data Rate Options
+### Pulse Repetition Frequency (PRF)
 ```python
-BR_110K = 0    # 110 kbps - Maximum range, lowest power
-BR_850K = 1    # 850 kbps - Recommended (best balance)
-BR_6M8  = 2    # 6.8 Mbps - Minimum range, highest throughput
+# PRF affects range, power consumption, and precision
+prf=dw1000.PRF_16M    # 16 MHz - Longer range, lower power
+prf=dw1000.PRF_64M    # 64 MHz - Better precision (default)
+
+# Usage examples
+dwt.configure(prf=dw1000.PRF_16M)  # For maximum range
+dwt.configure(prf=dw1000.PRF_64M)  # For ranging precision
+```
+
+### TX Preamble Length
+```python
+# Longer preambles improve range and sensitivity
+tx_preamble_length=dw1000.PLEN_64      # 64 symbols - Fast acquisition
+tx_preamble_length=dw1000.PLEN_128     # 128 symbols (default)
+tx_preamble_length=dw1000.PLEN_256     # 256 symbols
+tx_preamble_length=dw1000.PLEN_512     # 512 symbols  
+tx_preamble_length=dw1000.PLEN_1024    # 1024 symbols - Best range
+tx_preamble_length=dw1000.PLEN_1536    # 1536 symbols
+tx_preamble_length=dw1000.PLEN_2048    # 2048 symbols
+tx_preamble_length=dw1000.PLEN_4096    # 4096 symbols - Maximum range
+
+# Usage examples
+dwt.configure(tx_preamble_length=dw1000.PLEN_1024)  # Long range
+dwt.configure(tx_preamble_length=dw1000.PLEN_128)   # Fast communication
+```
+
+### RX Preamble Acquisition Chunk (PAC)
+```python
+# PAC should match preamble length for optimal performance
+rx_pac=dw1000.PAC8     # 8 symbols (default) - for preambles ≤128
+rx_pac=dw1000.PAC16    # 16 symbols - for preamble 256
+rx_pac=dw1000.PAC32    # 32 symbols - for preamble 512  
+rx_pac=dw1000.PAC64    # 64 symbols - for preambles ≥1024
+
+# PAC recommendations based on preamble length
+# PLEN_64, PLEN_128 → PAC8
+# PLEN_256 → PAC16
+# PLEN_512 → PAC32
+# PLEN_1024+ → PAC64
+
+# Usage examples
+dwt.configure(tx_preamble_length=dw1000.PLEN_256, rx_pac=dw1000.PAC16)
+dwt.configure(tx_preamble_length=dw1000.PLEN_1024, rx_pac=dw1000.PAC64)
+```
+
+### Preamble Codes
+```python
+# TX and RX codes must match between communicating devices
+# Code selection depends on channel and PRF
+tx_code=1    # Preamble code 1-20 (channel/PRF dependent)
+rx_code=1    # Should match TX code for communication
+
+# Recommended codes by channel (PRF 64MHz):
+# Channel 1: codes 1, 2
+# Channel 2: codes 3, 4  
+# Channel 3: codes 5, 6
+# Channel 4: codes 7, 8
+# Channel 5: codes 9, 10 (default uses code 9)
+# Channel 7: codes 11, 12
+
+# Usage examples
+dwt.configure(channel=2, tx_code=3, rx_code=3)  # Channel 2 with code 3
+dwt.configure(channel=5, tx_code=9, rx_code=9)  # Channel 5 with code 9 (default)
+```
+
+### Data Rate
+```python
+# Data rate affects range, power, and transmission time
+data_rate=dw1000.BR_110K    # 110 kbps - Maximum range, minimum power
+data_rate=dw1000.BR_850K    # 850 kbps - Best reliability (recommended)
+data_rate=dw1000.BR_6M8     # 6.8 Mbps - Minimum range, fastest (default)
+
+# Performance characteristics:
+# BR_110K: ~300m range, lowest power, slowest
+# BR_850K: ~150m range, good power, reliable (recommended for most apps)
+# BR_6M8:  ~80m range, highest power, fastest transmission
+
+# Usage examples
+dwt.configure(data_rate=dw1000.BR_850K)  # Recommended for reliability
+dwt.configure(data_rate=dw1000.BR_110K)  # Maximum range applications
+dwt.configure(data_rate=dw1000.BR_6M8)   # High-speed applications
+```
+
+### Special Frame Detection (SFD)
+```python
+# Standard vs Non-Standard SFD
+non_standard_sfd=False    # Use IEEE 802.15.4 standard SFD
+non_standard_sfd=True     # Use DW1000 proprietary SFD (default)
+
+# Non-standard SFD provides:
+# - Better performance in multipath environments
+# - Improved frame detection reliability
+# - Recommended for most applications
+
+# Usage examples
+dwt.configure(non_standard_sfd=True)   # Better performance (default)
+dwt.configure(non_standard_sfd=False)  # Standards compliance
+```
+
+### PHR (PHY Header) Mode  
+```python
+# PHR mode affects frame format and compatibility
+phr_mode=dw1000.PHRMODE_STD    # Standard IEEE 802.15.4 PHR (default)
+phr_mode=dw1000.PHRMODE_EXT    # Extended DW1000-specific PHR
+
+# Standard PHR:
+# - IEEE 802.15.4 compatible
+# - Maximum frame length ~127 bytes
+# - Best interoperability
+
+# Extended PHR:
+# - DW1000-specific extensions
+# - Longer frame lengths possible
+# - Better for custom protocols
+
+# Usage examples  
+dwt.configure(phr_mode=dw1000.PHRMODE_STD)  # Standards compliant (default)
+dwt.configure(phr_mode=dw1000.PHRMODE_EXT)  # Extended features
+```
+
+### SFD Timeout
+```python
+# SFD timeout in symbol periods
+sfd_timeout=129        # Default timeout (preamble_length + 1 + 8 - 8)
+sfd_timeout=1041       # Conservative timeout for difficult environments
+
+# The timeout should be:
+# - At least preamble_length + 1 + 8 - 8
+# - Higher values more tolerant of interference
+# - Lower values faster error detection
+
+# Usage examples
+dwt.configure(sfd_timeout=129)    # Default (matches 128 preamble)
+dwt.configure(sfd_timeout=1041)   # Conservative for noisy environments
+```
+
+### 🎯 Pre-configured Profiles
+
+Instead of manually configuring each parameter, use these tested profiles:
+
+```python
+# PROFILE 1: Maximum Reliability (recommended for most applications)
+dwt.configure(
+    channel=2,                              # Global frequency
+    prf=dw1000.PRF_64M,                    # Good precision
+    tx_preamble_length=dw1000.PLEN_128,    # Balanced performance
+    rx_pac=dw1000.PAC8,                    # Matches preamble
+    data_rate=dw1000.BR_850K,              # Best reliability
+    non_standard_sfd=True                   # Better performance
+)
+
+# PROFILE 2: Maximum Range
+dwt.configure(
+    channel=1,                              # European band
+    prf=dw1000.PRF_16M,                    # Lower power, longer range
+    tx_preamble_length=dw1000.PLEN_1024,   # Long preamble
+    rx_pac=dw1000.PAC64,                   # Matches long preamble
+    data_rate=dw1000.BR_110K,              # Lowest data rate
+    non_standard_sfd=True
+)
+
+# PROFILE 3: High-Speed Communication
+dwt.configure(
+    channel=5,                              # High frequency
+    prf=dw1000.PRF_64M,                    # Fast acquisition
+    tx_preamble_length=dw1000.PLEN_64,     # Short preamble
+    rx_pac=dw1000.PAC8,                    # Fast acquisition
+    data_rate=dw1000.BR_6M8,               # Highest speed
+    non_standard_sfd=True
+)
+
+# PROFILE 4: Precision Ranging (PolyPoint-style, default)
+dwt.configure()  # Uses optimized defaults:
+# channel=5, prf=PRF_64M, tx_preamble_length=PLEN_128, 
+# rx_pac=PAC8, data_rate=BR_6M8, non_standard_sfd=True
+```
+
+### Configuration Validation
+
+The module validates all configuration parameters:
+
+```python
+# Invalid configurations will raise RuntimeError
+try:
+    dwt.configure(channel=8)  # Invalid channel
+except RuntimeError as e:
+    print(f"Configuration error: {e}")
+
+# Valid ranges:
+# channel: 1, 2, 3, 4, 5, 7 (6 is not supported)
+# prf: PRF_16M or PRF_64M
+# tx_preamble_length: PLEN_64 to PLEN_4096
+# rx_pac: PAC8, PAC16, PAC32, PAC64
+# tx_code, rx_code: 1-20
+# data_rate: BR_110K, BR_850K, BR_6M8
+# phr_mode: PHRMODE_STD, PHRMODE_EXT
 ```
 
 ### SPI Configuration
