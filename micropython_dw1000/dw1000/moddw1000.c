@@ -14,6 +14,7 @@
 #include "py/runtime.h"
 #include "py/obj.h"
 #include "py/objtype.h"
+#include "py/objint.h"  // For mp_obj_int_t to extract long long values
 #include <string.h>
 #include "py/stream.h"
 #include "py/mperrno.h"
@@ -294,6 +295,10 @@ STATIC mp_obj_t dw1000_configure(size_t n_args, const mp_obj_t *pos_args, mp_map
     // Set XTAL trim (use default) - use correct function name
     dwt_setxtaltrim(15);  // Default XTAL trim value
     
+    // 4. Disable frame filtering for simple ranging (accept all frames)
+    // For production use with 802.15.4 frames, enable with DWT_FF_DATA_EN | DWT_FF_ACK_EN
+    dwt_enableframefilter(0);  // 0 = disable all filtering
+    
     return mp_const_none;
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_KW(dw1000_configure_obj, 1, dw1000_configure);
@@ -568,10 +573,453 @@ STATIC mp_obj_t dw1000_read_register(mp_obj_t self_in, mp_obj_t reg_id_obj) {
     }
     
     uint32_t reg_id = mp_obj_get_int(reg_id_obj);
-    uint32_t value = dwt_read32bitreg(reg_id);
-    return mp_obj_new_int_from_uint(value);
+    uint32_t reg_value = dwt_read32bitreg(reg_id);
+    return mp_obj_new_int_from_uint(reg_value);
 }
 STATIC MP_DEFINE_CONST_FUN_OBJ_2(dw1000_read_register_obj, dw1000_read_register);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_read_rx_timestamp()
+ *
+ * @brief Read RX timestamp from DW1000 (40-bit timestamp as integer)
+ */
+STATIC mp_obj_t dw1000_read_rx_timestamp(mp_obj_t self_in) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    uint64_t timestamp;
+    dwt_readrxtimestamp((uint8_t*)&timestamp);
+    
+    // Return as Python integer (40-bit value)
+    return mp_obj_new_int_from_ull(timestamp & 0xFFFFFFFFFFULL);
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_1(dw1000_read_rx_timestamp_obj, dw1000_read_rx_timestamp);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_read_tx_timestamp()
+ *
+ * @brief Read TX timestamp from DW1000 (40-bit timestamp as integer)
+ */
+STATIC mp_obj_t dw1000_read_tx_timestamp(mp_obj_t self_in) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    uint64_t timestamp;
+    dwt_readtxtimestamp((uint8_t*)&timestamp);
+    
+    // Return as Python integer (40-bit value)
+    return mp_obj_new_int_from_ull(timestamp & 0xFFFFFFFFFFULL);
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_1(dw1000_read_tx_timestamp_obj, dw1000_read_tx_timestamp);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_timestamp_to_seconds()
+ *
+ * @brief Convert DW1000 timestamp ticks to seconds (using DWT_TIME_UNITS)
+ */
+STATIC mp_obj_t dw1000_timestamp_to_seconds(mp_obj_t self_in, mp_obj_t timestamp_obj) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    // Convert to float first to handle 40-bit timestamps on 32-bit platforms
+    mp_float_t timestamp_float = mp_obj_get_float(timestamp_obj);
+    
+    // Convert using DWT_TIME_UNITS = 15.65e-12 seconds per tick
+    double seconds = timestamp_float * DWT_TIME_UNITS;
+    
+    return mp_obj_new_float(seconds);
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_2(dw1000_timestamp_to_seconds_obj, dw1000_timestamp_to_seconds);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_seconds_to_timestamp()
+ *
+ * @brief Convert seconds to DW1000 timestamp ticks (using DWT_TIME_UNITS)
+ */
+STATIC mp_obj_t dw1000_seconds_to_timestamp(mp_obj_t self_in, mp_obj_t seconds_obj) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    double seconds = mp_obj_get_float(seconds_obj);
+    
+    // Convert using DWT_TIME_UNITS = 15.65e-12 seconds per tick
+    uint64_t timestamp = (uint64_t)(seconds / DWT_TIME_UNITS);
+    
+    return mp_obj_new_int_from_ull(timestamp & 0xFFFFFFFFFFULL);
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_2(dw1000_seconds_to_timestamp_obj, dw1000_seconds_to_timestamp);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_read_system_timestamp()
+ *
+ * @brief Read current DW1000 system timestamp (for scheduling delayed transmissions)
+ * Returns high 32-bits of 40-bit timestamp (units are ~15.65ps * 256)
+ */
+STATIC mp_obj_t dw1000_read_system_timestamp(mp_obj_t self_in) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    // Read system timestamp high 32 bits (suitable for delayed TX scheduling)
+    uint32_t sys_time_high = dwt_readsystimestamphi32();
+    
+    // Convert to 40-bit timestamp by shifting left 8 bits
+    uint64_t timestamp = ((uint64_t)sys_time_high) << 8;
+    
+    return mp_obj_new_int_from_ull(timestamp);
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_1(dw1000_read_system_timestamp_obj, dw1000_read_system_timestamp);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_set_delayed_trx_time()
+ *
+ * @brief Set delayed TX/RX time (high 32-bits of 40-bit timestamp)
+ */
+STATIC mp_obj_t dw1000_set_delayed_trx_time(mp_obj_t self_in, mp_obj_t starttime_obj) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    uint64_t starttime = mp_obj_get_int(starttime_obj);
+    
+    // Extract high 32 bits (must be even per DW1000 spec)
+    uint32_t delay_time_high = ((starttime >> 8) & 0xFFFFFFFE);
+    
+    // Set delayed transmission/reception time using lab11 driver
+    dwt_setdelayedtrxtime(delay_time_high);
+    
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_2(dw1000_set_delayed_trx_time_obj, dw1000_set_delayed_trx_time);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_start_tx_delayed()
+ *
+ * @brief Start delayed transmission at previously scheduled time
+ * Must call set_delayed_trx_time() first, then load TX buffer, then call this
+ */
+STATIC mp_obj_t dw1000_start_tx_delayed(mp_obj_t self_in) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    // Start delayed transmission
+    int result = dwt_starttx(DWT_START_TX_DELAYED);
+    
+    if (result != DWT_SUCCESS) {
+        // Delayed transmission failed (usually means scheduled time already passed)
+        mp_raise_OSError(MP_EIO);
+    }
+    
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_1(dw1000_start_tx_delayed_obj, dw1000_start_tx_delayed);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_tx_frame_delayed()
+ *
+ * @brief Transmit a frame at a scheduled future time (all-in-one convenience function)
+ * Combines set_delayed_trx_time, tx buffer loading, and start_tx_delayed
+ * 
+ * @param data_obj - frame data to transmit
+ * @param scheduled_time_obj - 40-bit timestamp when to transmit (must be future and even)
+ */
+STATIC mp_obj_t dw1000_tx_frame_delayed(mp_obj_t self_in, mp_obj_t data_obj, mp_obj_t scheduled_time_obj) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    // Get data buffer
+    mp_buffer_info_t bufinfo;
+    mp_get_buffer_raise(data_obj, &bufinfo, MP_BUFFER_READ);
+    
+    if (bufinfo.len == 0) {
+        mp_raise_ValueError(MP_ERROR_TEXT("Empty data buffer"));
+    }
+    
+    // Get scheduled transmission time (40-bit timestamp)
+    // Use mp_obj_get_int_truncated for large values that might overflow mp_obj_get_int
+    uint64_t scheduled_time = (uint64_t)mp_obj_get_int_truncated(scheduled_time_obj);
+    
+    // Ensure scheduled time is even (hardware requirement - bit 0 must be 0)
+    scheduled_time &= 0xFFFFFFFFFFFFFFFEULL;
+    
+    // Extract high 32 bits for dwt_setdelayedtrxtime (shifts right by 8 bits)
+    uint32_t delay_time_high = (uint32_t)(scheduled_time >> 8);
+    
+    // Step 1: Set delayed transmission time
+    dwt_setdelayedtrxtime(delay_time_high);
+    
+    // Step 2: Write data to TX buffer
+    uint16_t total_frame_len = bufinfo.len + 2;  // +2 for auto-CRC
+    dwt_writetxdata(total_frame_len, (uint8_t*)bufinfo.buf, 0);
+    dwt_writetxfctrl(total_frame_len, 0, 0);
+    
+    // Step 3: Start delayed transmission
+    int result = dwt_starttx(DWT_START_TX_DELAYED);
+    
+    if (result != DWT_SUCCESS) {
+        // Delayed transmission failed (scheduled time likely already passed)
+        mp_raise_OSError(MP_EIO);
+    }
+    
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_3(dw1000_tx_frame_delayed_obj, dw1000_tx_frame_delayed);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_send_ranging_response()
+ *
+ * @brief TIME-CRITICAL: Send ranging response with hardware-scheduled delayed TX
+ * 
+ * This function does everything atomically in C to minimize timing jitter:
+ * 1. Read current system timestamp
+ * 2. Calculate T3 = current + delay_us
+ * 3. Build response message inline
+ * 4. Schedule and start delayed transmission
+ * 
+ * @param t2_obj - T2 timestamp (POLL RX time) as 64-bit integer
+ * @param delay_us_obj - Delay in microseconds (e.g. 5000 for 5ms)
+ * @param poll_seq_obj - Poll sequence number
+ * @param device_id_obj - Responder device ID
+ * 
+ * @return Tuple: (t3_scheduled, t3_actual) or raises OSError if failed
+ */
+STATIC mp_obj_t dw1000_send_ranging_response(size_t n_args, const mp_obj_t *args) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(args[0]);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    // Parse arguments - T2 is a 40-bit timestamp (up to 1,099,511,627,776)
+    // Must extract full 64-bit value - can't use mp_obj_get_int() (only 32-bit on RP2040)
+    // Use conversion through bytes to preserve all 64 bits
+    uint64_t t2 = 0;
+    byte t2_bytes[8];
+    mp_obj_int_to_bytes_impl(args[1], false, 8, t2_bytes);  // Little endian, 8 bytes
+    memcpy(&t2, t2_bytes, 8);
+    
+    uint32_t delay_us = mp_obj_get_int(args[2]);
+    uint8_t poll_seq = mp_obj_get_int(args[3]);
+    uint8_t device_id = mp_obj_get_int(args[4]);
+    
+    // Optional TX calibration offset (PolyPoint-style software calibration)
+    // This is ADDED to T3 before putting in the message
+    int32_t tx_cal = (n_args >= 6) ? mp_obj_get_int(args[5]) : 0;
+    
+    // Variables for atomic section results
+    uint64_t current_time;  // Current system timestamp (40-bit)
+    uint64_t t3;
+    uint32_t delay_time_high;
+    
+    // ============================================================================
+    // ATOMIC SECTION: Disable interrupts during time-critical operations
+    // This prevents USB, timer, and other interrupts from adding jitter during
+    // the critical window between reading timestamp and setting delayed TX time.
+    // Pattern matches PolyPoint's timer_disable_interrupt() approach.
+    // ============================================================================
+    mp_uint_t atomic_state = MICROPY_BEGIN_ATOMIC_SECTION();
+    
+    // TIME-CRITICAL SECTION STARTS HERE
+    // Read current 40-bit timestamp (5 bytes)
+    // BUG FIX: Use dwt_readsystime() to get FULL 40-bit timestamp, not just high 32 bits!
+    byte sys_time_bytes[5];
+    dwt_readsystime(sys_time_bytes);
+    
+    // Convert 5 bytes (little-endian) to 64-bit integer
+    current_time = 0;
+    for(int i = 0; i < 5; i++) {
+        current_time |= ((uint64_t)sys_time_bytes[i]) << (i * 8);
+    }
+    
+    // Convert delay from microseconds to ticks
+    // Use the EXACT PolyPoint formula: ticks = (us / DWT_TIME_UNITS) / 1e6
+    // where DWT_TIME_UNITS = (1.0/499.2e6/128.0) = 15.65e-12 s
+    // This gives: ticks = us / (15.65e-12 * 1e6) = us / 15.65e-6
+    // 
+    // IMPORTANT: Do the division, not multiplication! This matches PolyPoint exactly
+    // and avoids accumulating rounding errors from approximate multiplication constants.
+    uint64_t delay_ticks = (uint64_t)((double)delay_us / DWT_TIME_UNITS / 1e6);
+    
+    // Calculate T3
+    t3 = current_time + delay_ticks;
+    t3 &= 0xFFFFFFFFFFULL;  // Mask to 40 bits (DW1000 timestamp is 40-bit)
+    t3 &= 0xFFFFFFFFFFFFFFFEULL;  // Must be even (bit 0 = 0)
+    
+    // Extract high 32 bits for dwt_setdelayedtrxtime
+    delay_time_high = (uint32_t)(t3 >> 8);
+    
+    // Set delayed transmission time
+    dwt_setdelayedtrxtime(delay_time_high);
+    
+    // TIME-CRITICAL SECTION ENDS HERE
+    MICROPY_END_ATOMIC_SECTION(atomic_state);
+    // ============================================================================
+    
+    // Build response message inline (26 bytes total)
+    // Format: [type][device_id][seq][padding(7)][T2(5)][padding(3)][T3(5)][padding(3)]
+    //         Arduino-DW1000 uses 5-byte timestamps (40-bit), not 8!
+    uint8_t response[26];
+    response[0] = 0x62;  // MSG_RESPONSE
+    response[1] = device_id;
+    response[2] = poll_seq;
+    // Padding bytes [3-9]
+    memset(&response[3], 0, 7);
+    
+    // Mask T2 to 40 bits and write as little-endian (5 bytes only!)
+    uint64_t t2_masked = t2 & 0xFFFFFFFFFFULL;
+    memcpy(&response[10], &t2_masked, 5);  // Only 5 bytes!
+    memset(&response[15], 0, 3);  // Pad remaining 3 bytes
+    
+    // T3 timestamp [18-22] - Apply TX calibration (PolyPoint pattern)
+    // tx_cal is ADDED to T3 to compensate for TX antenna delay
+    uint64_t t3_cal = (t3 + tx_cal) & 0xFFFFFFFFFFULL;  // Mask to 40 bits after adding calibration
+    memcpy(&response[18], &t3_cal, 5);  // Only 5 bytes!
+    memset(&response[23], 0, 3);  // Pad remaining 3 bytes
+    
+    // Setup TX frame control
+    uint16_t total_frame_len = 26 + 2;  // +2 for CRC
+    dwt_writetxfctrl(total_frame_len, 0, 0);
+    
+    // ============================================================================
+    // TX ORDER FIX: Match PolyPoint's proven implementation
+    // PolyPoint calls dwt_starttx() BEFORE dwt_writetxdata() in
+    // oneway_anchor.c lines 209-211. This minimizes latency between setting
+    // the delayed TX time and starting transmission.
+    // ============================================================================
+    
+    // Start delayed transmission FIRST (PolyPoint order)
+    int result = dwt_starttx(DWT_START_TX_DELAYED);
+    
+    if (result != DWT_SUCCESS) {
+        mp_raise_OSError(MP_EIO);
+    }
+    
+    // THEN write TX data (PolyPoint order)
+    dwt_writetxdata(total_frame_len, response, 0);
+    
+    // Return t3 for verification (RAW t3, before calibration)
+    return mp_obj_new_int_from_ull(t3);
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_VAR_BETWEEN(dw1000_send_ranging_response_obj, 5, 6, dw1000_send_ranging_response);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_set_rx_antenna_delay()
+ *
+ * @brief Set RX antenna delay for timestamp calibration
+ */
+STATIC mp_obj_t dw1000_set_rx_antenna_delay(mp_obj_t self_in, mp_obj_t delay_obj) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    uint16_t delay = mp_obj_get_int(delay_obj);
+    
+    // Set RX antenna delay using lab11 driver
+    dwt_setrxantennadelay(delay);
+    
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_2(dw1000_set_rx_antenna_delay_obj, dw1000_set_rx_antenna_delay);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_set_tx_antenna_delay()
+ *
+ * @brief Set TX antenna delay for timestamp calibration
+ */
+STATIC mp_obj_t dw1000_set_tx_antenna_delay(mp_obj_t self_in, mp_obj_t delay_obj) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    uint16_t delay = mp_obj_get_int(delay_obj);
+    
+    // Set TX antenna delay using lab11 driver
+    dwt_settxantennadelay(delay);
+    
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_2(dw1000_set_tx_antenna_delay_obj, dw1000_set_tx_antenna_delay);
+
+/*! ------------------------------------------------------------------------------------------------------------------
+ * @fn dw1000_spi_set_baudrate()
+ *
+ * @brief Change SPI baudrate (for speed switching during init/wakeup vs normal operations)
+ * 
+ * DW1000 DATASHEET REQUIREMENT: SPI must be < 3 MHz during:
+ *   - Initial power-on initialization (dwt_initialise)
+ *   - Waking from DEEPSLEEP (reading device ID after wakeup)
+ *   - Sleep configuration (dwt_configuresleep, dwt_configuresleepcnt)
+ * 
+ * After init/wakeup, SPI can be increased to higher speeds (e.g., 6 MHz like PolyPoint)
+ * 
+ * TODO: Implement speed switching logic in Python:
+ *   1. INIT SEQUENCE:
+ *      spi = SPI(0, baudrate=1000000)  # Start slow (<3 MHz)
+ *      dwt = DW1000(spi, cs, reset, irq)
+ *      dwt.init()                      # Must use slow SPI!
+ *      dwt.spi_set_baudrate(6000000)   # Switch to fast after init
+ *      dwt.configure(...)              # Normal operations at fast speed
+ * 
+ *   2. WAKEUP SEQUENCE (future sleep/wake implementation):
+ *      dwt.spi_set_baudrate(1000000)   # Slow before wakeup
+ *      dwt.wakeup()                    # Wake from sleep
+ *      time.sleep_ms(5)                # Wait for PLL to lock
+ *      dwt.spi_set_baudrate(6000000)   # Fast after wakeup
+ * 
+ * Reference: PolyPoint uses prescaler 64 (~0.75 MHz) for init/wakeup,
+ *            prescaler 8 (~6 MHz) for normal operations
+ * 
+ * @param baudrate - new SPI baudrate in Hz (e.g., 1000000 for 1 MHz, 6000000 for 6 MHz)
+ */
+STATIC mp_obj_t dw1000_spi_set_baudrate(mp_obj_t self_in, mp_obj_t baudrate_obj) {
+    dw1000_obj_t *self = MP_OBJ_TO_PTR(self_in);
+    
+    if (!self->initialized) {
+        mp_raise_msg(&mp_type_RuntimeError, MP_ERROR_TEXT("DW1000 not initialized"));
+    }
+    
+    // Call SPI.init(baudrate=new_baudrate) to change the SPI speed
+    // Load the 'init' method from the SPI object
+    mp_obj_t init_method = mp_load_attr(self->spi, MP_QSTR_init);
+    
+    // Create keyword args map with 'baudrate' key
+    mp_obj_t kw_args[2] = {
+        MP_OBJ_NEW_QSTR(MP_QSTR_baudrate),
+        baudrate_obj
+    };
+    
+    // Call spi.init(baudrate=baudrate_obj)
+    mp_call_function_n_kw(init_method, 0, 1, kw_args);
+    
+    return mp_const_none;
+}
+STATIC MP_DEFINE_CONST_FUN_OBJ_2(dw1000_spi_set_baudrate_obj, dw1000_spi_set_baudrate);
 
 /*! ------------------------------------------------------------------------------------------------------------------
  * @fn dw1000_set_rx_callback()
@@ -917,6 +1365,21 @@ STATIC const mp_rom_map_elem_t dw1000_locals_dict_table[] = {
     { MP_ROM_QSTR(MP_QSTR_get_sys_state), MP_ROM_PTR(&dw1000_get_sys_state_obj) },
     { MP_ROM_QSTR(MP_QSTR_get_rx_finfo), MP_ROM_PTR(&dw1000_get_rx_finfo_obj) },
     { MP_ROM_QSTR(MP_QSTR_read_register), MP_ROM_PTR(&dw1000_read_register_obj) },
+    // Timestamp functions
+    { MP_ROM_QSTR(MP_QSTR_read_rx_timestamp), MP_ROM_PTR(&dw1000_read_rx_timestamp_obj) },
+    { MP_ROM_QSTR(MP_QSTR_read_tx_timestamp), MP_ROM_PTR(&dw1000_read_tx_timestamp_obj) },
+    { MP_ROM_QSTR(MP_QSTR_read_system_timestamp), MP_ROM_PTR(&dw1000_read_system_timestamp_obj) },
+    { MP_ROM_QSTR(MP_QSTR_timestamp_to_seconds), MP_ROM_PTR(&dw1000_timestamp_to_seconds_obj) },
+    { MP_ROM_QSTR(MP_QSTR_seconds_to_timestamp), MP_ROM_PTR(&dw1000_seconds_to_timestamp_obj) },
+    // Ranging functions
+    { MP_ROM_QSTR(MP_QSTR_set_delayed_trx_time), MP_ROM_PTR(&dw1000_set_delayed_trx_time_obj) },
+    { MP_ROM_QSTR(MP_QSTR_start_tx_delayed), MP_ROM_PTR(&dw1000_start_tx_delayed_obj) },
+    { MP_ROM_QSTR(MP_QSTR_tx_frame_delayed), MP_ROM_PTR(&dw1000_tx_frame_delayed_obj) },
+    { MP_ROM_QSTR(MP_QSTR_send_ranging_response), MP_ROM_PTR(&dw1000_send_ranging_response_obj) },
+    { MP_ROM_QSTR(MP_QSTR_set_rx_antenna_delay), MP_ROM_PTR(&dw1000_set_rx_antenna_delay_obj) },
+    { MP_ROM_QSTR(MP_QSTR_set_tx_antenna_delay), MP_ROM_PTR(&dw1000_set_tx_antenna_delay_obj) },
+    // SPI speed control
+    { MP_ROM_QSTR(MP_QSTR_spi_set_baudrate), MP_ROM_PTR(&dw1000_spi_set_baudrate_obj) },
     // Callback functions
     { MP_ROM_QSTR(MP_QSTR_set_rx_callback), MP_ROM_PTR(&dw1000_set_rx_callback_obj) },
     { MP_ROM_QSTR(MP_QSTR_set_tx_callback), MP_ROM_PTR(&dw1000_set_tx_callback_obj) },
@@ -1009,6 +1472,12 @@ STATIC const mp_rom_map_elem_t dw1000_module_globals_table[] = {
     { MP_ROM_QSTR(MP_QSTR_SYS_STATUS_ID), MP_ROM_INT(SYS_STATUS_ID) },
     { MP_ROM_QSTR(MP_QSTR_SYS_STATE_ID), MP_ROM_INT(SYS_STATE_ID) },
     { MP_ROM_QSTR(MP_QSTR_RX_FINFO_ID), MP_ROM_INT(RX_FINFO_ID) },
+    
+    // Timing constants for ranging
+    // DWT_TIME_UNITS: DW1000 hardware clock period (1/(64MHz * 499.2/64 * 128)) = 15.65e-12 seconds
+    // Best accessed via timestamp_to_seconds() and seconds_to_timestamp() conversion functions
+    // SPEED_OF_LIGHT: For distance calculations (PolyPoint calibrated value: 299,702,547 m/s)
+    // Standard physics value is 299,792,458 m/s
     
     // System state masks and values (custom definitions)
     { MP_ROM_QSTR(MP_QSTR_SYS_STATE_RX_STATE), MP_ROM_INT(SYS_STATE_RX_STATE) },

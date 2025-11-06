@@ -136,15 +136,30 @@ frame_error = (status & 0x0400) != 0   # Bit 10
 tx_complete = (status & 0x0080) != 0   # Bit 7
 ```
 
+## Ranging Implementation Status
+
+**✅ TWO-WAY RANGING FULLY OPERATIONAL:**
+- Hardware-scheduled delayed TX: 3-5 nanosecond precision
+- All time-critical code optimized in C (send_ranging_response)
+- Consistent distance measurements achieved
+- See `RANGING_STATUS.md` for detailed analysis
+
+**⚠️ CALIBRATION REQUIRED FOR ACCURACY:**
+1. **Antenna Delay** (required for <10m accuracy):
+   - Current error: ~150-160m for 0.6m actual distance
+   - Estimated antenna delay: ~8,000-9,000 ticks per device
+   - Functions: `set_rx_antenna_delay()`, `set_tx_antenna_delay()` ✅ IMPLEMENTED
+   - See calibration procedure in RANGING_STATUS.md
+
+2. **Clock Drift Compensation** (required for <1m accuracy):
+   - Crystal frequency mismatch (50-100 ppm typical)
+   - Implement PolyPoint-style: `clock_ratio = (T4-T1)/(T3-T2)`
+   - Eliminates unsynchronized clock frequency errors
+
 ## Missing Lab11 Driver Features (Implementation Candidates)
 
 **High Priority:**
 - `dwt_setrxtimeout(uint16)` - RX timeout configuration
-- `dwt_readrxtimestamp()` - RX timestamp reading  
-- `dwt_readtxtimestamp()` - TX timestamp reading
-- `dwt_setdelayedtrxtime(uint32)` - Delayed TX/RX timing
-- `dwt_setrxantennadelay(uint16)` - Antenna delay calibration
-- `dwt_settxantennadelay(uint16)` - Antenna delay calibration
 
 **Medium Priority:**
 - `dwt_setsniffmode()` - Low power sniff mode
@@ -164,12 +179,15 @@ tx_complete = (status & 0x0080) != 0   # Bit 7
 - Configuration errors → `RuntimeError`
 - All methods require `initialized` flag check
 
-## Current Status: 🏆 PRODUCTION READY WITH POLYPOINT FEATURES
-✅ **21 methods implemented** including full callback system and PolyPoint features
+## Current Status: 🏆 RANGING OPERATIONAL - NEEDS CALIBRATION
+
+✅ **23 methods implemented** including full callback system and PolyPoint features
 ✅ **Event-driven architecture** working perfectly  
 ✅ **PolyPoint auto RX and optimal ranging** - professional ranging capabilities
-✅ **Real frame reception** tested and confirmed
-✅ **Auto-initialization** and robust error handling
-✅ **Enhanced diagnostics** for debugging and monitoring
+✅ **Two-way ranging working** with 3-5ns T3 precision
+✅ **Hardware-scheduled delayed TX** fully operational
+✅ **Antenna delay functions** implemented (set_rx_antenna_delay, set_tx_antenna_delay)
+✅ **All time-critical code in C** (send_ranging_response is atomic)
+⚠️  **Calibration required** for accurate distance measurements (see RANGING_STATUS.md)
 
-The module provides **professional-grade UWB development** with industry-standard PolyPoint features for optimal ranging performance.
+The module provides **professional-grade UWB development** with industry-standard PolyPoint features. Ranging is operational but requires antenna delay calibration for accurate distance measurements.
